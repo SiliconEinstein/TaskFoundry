@@ -408,6 +408,8 @@ def audit_bound(
     mode="blind",
     score=0.4,
     leakage_overrides: dict | None = None,
+    request_revision="r1",
+    revision_correction=False,
 ):
     evidence = tmp_path / f"bound-{mode}-{index}"
     evidence.mkdir()
@@ -420,7 +422,7 @@ def audit_bound(
         "extra_instruction_paths": [],
     }))
     request = ResearcherRequest(
-        request_id=f"request-{mode}-{index}", run_id="run-1", question_revision="r1",
+        request_id=f"request-{mode}-{index}", run_id="run-1", question_revision=request_revision,
         attempt_index=index, mode=mode, package_path=package_path,
         package_sha256=package_sha256(Path(package_path)), job_config_path=str(config),
         job_config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
@@ -474,10 +476,26 @@ def audit_bound(
             "approved_context_digests": list(request.context_digests),
             "hint_sha256": request.context_digests[0],
         }))
+    correction_path = None
+    if revision_correction:
+        correction_path = evidence / "revision-correction.json"
+        correction_path.write_text(json.dumps({
+            "schema_version": 1,
+            "evidence_type": "request-revision-correction",
+            "verdict": "PASS",
+            "reviewer_independent": True,
+            "request_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+            "request_question_revision": request.question_revision,
+            "canonical_question_revision": flow.snapshot.question_revision,
+            "package_sha256": flow.snapshot.package_digest,
+            "researcher_rerun": False,
+            "scientific_count_delta": 1,
+        }))
     return flow.audit_researcher_receipt(
         Actor.REVIEWER, request_path=request_path, capability_path=capability,
         receipt_path=receipt_path, leakage_evidence_path=leakage,
         hint_review_path=hint_review,
+        revision_correction_path=correction_path,
         idempotency_key=f"bound-audit-{mode}-{index}",
     )
 
@@ -917,6 +935,23 @@ def test_leakage_audit_must_bind_the_exact_researcher_execution(tmp_path) -> Non
             1,
             leakage_overrides={"sandbox_id": "unrelated-sandbox"},
         )
+
+
+def test_independent_revision_correction_imports_existing_scientific_attempt_once(tmp_path) -> None:
+    flow = ready_workflow(tmp_path)
+
+    snapshot = audit_bound(
+        flow,
+        tmp_path,
+        1,
+        score=0.9,
+        request_revision="runtime-delivery-v2",
+        revision_correction=True,
+    )
+
+    assert snapshot.state is RunState.TOO_EASY
+    assert len(snapshot.attempts) == 1
+    assert snapshot.evidence["request_revision_correction"]["request_question_revision"] == "runtime-delivery-v2"
 
 
 def test_hint_receipt_requires_independent_review(tmp_path) -> None:

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import hashlib
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -374,12 +375,12 @@ def classify_job_outcome(job_dir: Path, exit_code: int) -> JobOutcome:
             else "PLATFORM_FAILURE"
         )
         return JobOutcome(kind, None, str(result_path), stage)
-    rewards = [
-        metric["mean"]
-        for evaluation in stats.get("evals", {}).values()
-        for metric in evaluation.get("metrics", [])
-        if isinstance(metric.get("mean"), (int, float))
-    ]
+    rewards = []
+    for evaluation in stats.get("evals", {}).values():
+        for metric in evaluation.get("metrics", []):
+            value = metric.get("reward", metric.get("mean"))
+            if type(value) in (int, float) and math.isfinite(float(value)):
+                rewards.append(float(value))
     if len(rewards) != 1 or exit_code != 0:
         return JobOutcome("PLATFORM_FAILURE", None, str(result_path), FailureStage.PLATFORM)
     return JobOutcome("SCIENTIFIC_RESULT", float(rewards[0]), str(result_path))

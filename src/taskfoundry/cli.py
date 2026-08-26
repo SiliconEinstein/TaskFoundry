@@ -88,6 +88,7 @@ def parser() -> argparse.ArgumentParser:
     audit.add_argument("receipt", type=Path)
     audit.add_argument("leakage_evidence", type=Path)
     audit.add_argument("--hint-review", type=Path)
+    audit.add_argument("--revision-correction", type=Path)
 
     revision = commands.add_parser("begin-difficulty-revision")
     revision.add_argument("run_dir", type=Path)
@@ -442,6 +443,7 @@ def _audit_researcher(args: argparse.Namespace) -> dict[str, Any]:
         receipt_path=args.receipt,
         leakage_evidence_path=args.leakage_evidence,
         hint_review_path=args.hint_review,
+        revision_correction_path=args.revision_correction,
         idempotency_key=f"attempt:audit:{file_sha256(args.receipt)}",
     )
     return snapshot.to_dict()

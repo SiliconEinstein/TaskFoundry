@@ -595,6 +595,7 @@ class RunWorkflow:
         receipt_path: Path,
         leakage_evidence_path: Path,
         hint_review_path: Path | None = None,
+        revision_correction_path: Path | None = None,
         idempotency_key: str,
     ) -> RunSnapshot:
         """记录尝试前核对不可变 Researcher 产物。"""
@@ -608,12 +609,34 @@ class RunWorkflow:
             or receipt.request_id != request.request_id
         ):
             raise WorkflowError("attempt is not backed by a consumed Researcher capability")
-        if (
-            request.run_id != current.run_id
-            or request.question_revision != current.question_revision
-            or request.package_sha256 != current.package_digest
-        ):
+        if request.run_id != current.run_id or request.package_sha256 != current.package_digest:
             raise WorkflowError("attempt does not target this run and frozen package")
+        revision_evidence: dict = {}
+        if request.question_revision != current.question_revision:
+            if revision_correction_path is None:
+                raise WorkflowError("attempt does not target this run and frozen package")
+            correction = self._json_object(revision_correction_path)
+            expected_correction = {
+                "schema_version": 1,
+                "evidence_type": "request-revision-correction",
+                "verdict": "PASS",
+                "reviewer_independent": True,
+                "request_sha256": file_sha256(request_path),
+                "request_question_revision": request.question_revision,
+                "canonical_question_revision": current.question_revision,
+                "package_sha256": current.package_digest,
+                "researcher_rerun": False,
+                "scientific_count_delta": 1,
+            }
+            if any(correction.get(key) != value for key, value in expected_correction.items()):
+                raise WorkflowError("attempt revision correction is incomplete or not independently bound")
+            revision_evidence = {
+                "request_revision_correction": correction
+                | {
+                    "path": str(revision_correction_path.resolve()),
+                    "sha256": file_sha256(revision_correction_path),
+                }
+            }
         leakage = self._json_object(leakage_evidence_path)
         leakage_expected = {
             "schema_version": 1,
@@ -659,7 +682,12 @@ class RunWorkflow:
             leakage_free=True,
             leakage_evidence_sha256=file_sha256(leakage_evidence_path),
         )
-        return self._record_attempt(actor, attempt, idempotency_key, extra_evidence=extra_evidence)
+        return self._record_attempt(
+            actor,
+            attempt,
+            idempotency_key,
+            extra_evidence=revision_evidence | extra_evidence,
+        )
 
     def _record_attempt(
         self,

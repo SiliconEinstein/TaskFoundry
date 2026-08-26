@@ -109,6 +109,38 @@ def test_classifies_scientific_result(tmp_path) -> None:
     assert classify_job_result(job, 0)[0:2] == ("SCIENTIFIC_RESULT", 0.7)
 
 
+def test_classifies_harbor_metric_reward_without_legacy_mean(tmp_path) -> None:
+    """Accept Harbor 0.18 metrics where the aggregate is named reward."""
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "result.json").write_text(
+        json.dumps(
+            {
+                "id": "job-id",
+                "stats": {
+                    "n_completed_trials": 1,
+                    "n_errored_trials": 0,
+                    "evals": {
+                        "eval": {
+                            "metrics": [
+                                {
+                                    "formal_score": 0.99,
+                                    "recommendation_accuracy": 1.0,
+                                    "reward": 0.975,
+                                }
+                            ],
+                            "exception_stats": {},
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert classify_job_result(job, 0)[0:2] == ("SCIENTIFIC_RESULT", 0.975)
+
+
 @pytest.mark.parametrize(
     "errors,exception,expected",
     [
