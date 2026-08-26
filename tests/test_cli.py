@@ -4,13 +4,17 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+import taskfoundry.scheduler as scheduler_module
+
 from taskfoundry.codex_agent import DispatchReceipt
 from taskfoundry.cli import main
 from taskfoundry.package import package_sha256
 from taskfoundry.researcher import ResearcherReceipt
-from taskfoundry.labwright import EnvironmentDeltaRequest, FileLabwrightRegistry
+from taskfoundry.labwright import ArtifactIdentity, EnvironmentDeltaRequest, FileLabwrightRegistry
+from taskfoundry.labwright_runtime import artifact_identity_sha256
 from taskfoundry.health import BoundHealthEvidence, HealthGate
-from taskfoundry.model import Actor
+from taskfoundry.model import Actor, RunState
 from taskfoundry.store import RunStore
 from taskfoundry.validation import HealthEvidence
 from taskfoundry.workflow import RunWorkflow
@@ -30,6 +34,54 @@ def make_package(root):
     (root / "tests").mkdir()
     (root / "tests/test.sh").write_text("#!/bin/sh\necho 1 > /logs/verifier/reward.txt\n")
     return root
+
+
+def design_links(tmp_path: Path) -> dict[str, dict[str, str]]:
+    """为只测试 CLI 幂等性的裸状态生成稳定设计证据引用。"""
+    result: dict[str, dict[str, str]] = {}
+    for name in ("source_role_map", "ground_truth_ledger"):
+        path = tmp_path / f"{name}.json"
+        path.write_text("{}")
+        result[name] = {
+            "path": str(path.resolve()),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    return result
+
+
+def write_design_evidence(brief: Path, tmp_path: Path, revision: str = "r1") -> tuple[Path, Path]:
+    """生成可由 attach-design-evidence 命令接纳的两份证据。"""
+    value = json.loads(brief.read_text())
+    digest = hashlib.sha256(brief.read_bytes()).hexdigest()
+    source_ids = [item["source_id"] for item in value["source_questions"]]
+    role_map = tmp_path / "source-role-map.json"
+    role_map.write_text(json.dumps({
+        "schema_version": 1,
+        "evidence_type": "source-role-map",
+        "question_revision": revision,
+        "brief_sha256": digest,
+        "source_ids": source_ids,
+        "roles": value["evidence_roles"],
+        "immutable_source_sha256s": {
+            source_id: hashlib.sha256(source_id.encode()).hexdigest()
+            for source_id in source_ids
+        },
+        "license_review_pass": True,
+    }))
+    ledger = tmp_path / "ground-truth-ledger.json"
+    ledger.write_text(json.dumps({
+        "schema_version": 1,
+        "evidence_type": "ground-truth-ledger",
+        "question_revision": revision,
+        "brief_sha256": digest,
+        "scored_quantities": ["prediction", "method_selection"],
+        "producer_sha256": "1" * 64,
+        "independent_crosscheck_sha256": "2" * 64,
+        "scoring_contract_sha256": "3" * 64,
+        "derived_reference": True,
+        "crosscheck_pass": True,
+    }))
+    return role_map, ledger
 
 
 def test_status_prints_snapshot(tmp_path, capsys) -> None:
@@ -84,6 +136,11 @@ def test_cli_can_prepare_first_blind_without_stable_environment(tmp_path, capsys
 
     assert main(["begin-authoring", str(run)]) == 0
     capsys.readouterr()
+    role_map, ledger = write_design_evidence(brief, tmp_path)
+    assert main([
+        "attach-design-evidence", str(run), str(role_map), str(ledger),
+    ]) == 0
+    capsys.readouterr()
     assert main(["freeze-package", str(run), str(task)]) == 0
     capsys.readouterr()
     assert main([
@@ -106,6 +163,7 @@ def test_freeze_package_idempotency_is_scoped_to_question_revision(tmp_path, cap
         "state": "AUTHORING",
         "sequence": 0,
         "question_revision": "r1",
+        "evidence": {"design_evidence": design_links(tmp_path)},
     }))
     task = make_package(tmp_path / "task")
 
@@ -123,6 +181,9 @@ def test_freeze_package_idempotency_is_scoped_to_question_revision(tmp_path, cap
         reason,
         "environment-revision:r2",
     )
+    revised_state = json.loads((run / "state.json").read_text())
+    revised_state.setdefault("evidence", {})["design_evidence"] = design_links(tmp_path)
+    (run / "state.json").write_text(json.dumps(revised_state))
 
     assert main(["freeze-package", str(run), str(task)]) == 0
     r2 = json.loads(capsys.readouterr().out)
@@ -152,6 +213,7 @@ def test_accept_health_idempotency_is_scoped_to_question_revision(tmp_path, caps
         "state": "AUTHORING",
         "sequence": 0,
         "question_revision": "r1",
+        "evidence": {"design_evidence": design_links(tmp_path)},
     }))
     task = make_package(tmp_path / "task")
     health_path = tmp_path / "preflight.json"
@@ -184,6 +246,9 @@ def test_accept_health_idempotency_is_scoped_to_question_revision(tmp_path, caps
         reason,
         "environment-revision:r2",
     )
+    revised_state = json.loads((run / "state.json").read_text())
+    revised_state.setdefault("evidence", {})["design_evidence"] = design_links(tmp_path)
+    (run / "state.json").write_text(json.dumps(revised_state))
     assert main(["freeze-package", str(run), str(task)]) == 0
     capsys.readouterr()
 
@@ -211,6 +276,7 @@ def test_start_blind_idempotency_is_scoped_to_question_revision(tmp_path, capsys
         "state": "AUTHORING",
         "sequence": 0,
         "question_revision": "r1",
+        "evidence": {"design_evidence": design_links(tmp_path)},
     }))
     task = make_package(tmp_path / "task")
     health_path = tmp_path / "preflight.json"
@@ -250,6 +316,9 @@ def test_start_blind_idempotency_is_scoped_to_question_revision(tmp_path, capsys
         reason,
         "environment-revision:r2",
     )
+    revised_state = json.loads((run / "state.json").read_text())
+    revised_state.setdefault("evidence", {})["design_evidence"] = design_links(tmp_path)
+    (run / "state.json").write_text(json.dumps(revised_state))
     assert main(["freeze-package", str(run), str(task)]) == 0
     capsys.readouterr()
     assert main(health_command) == 0
@@ -490,7 +559,7 @@ def test_dispatch_and_researcher_run_handlers(tmp_path, capsys, monkeypatch) -> 
 
 def test_scheduler_commands_activate_and_report_question(tmp_path, capsys) -> None:
     run = tmp_path / "run"
-    RunStore(run).initialize("q1")
+    RunStore(run).initialize("q3")
     prompt = tmp_path / "teacher.md"
     prompt.write_text("[TASKFOUNDRY ROLE=teacher]\n继续正式出题。\n")
     root = tmp_path / "scheduler"
@@ -498,30 +567,161 @@ def test_scheduler_commands_activate_and_report_question(tmp_path, capsys) -> No
     assert main([
         "scheduler-enqueue",
         str(root),
-        "q1",
+        "q3",
         str(run),
         "--teacher-thread-id",
         "teacher-thread",
         "--teacher-prompt",
         str(prompt),
     ]) == 0
-    assert json.loads(capsys.readouterr().out)["activated"] == ["q1"]
+    enqueued = json.loads(capsys.readouterr().out)
+    assert enqueued["activated"] == ["q3"]
+    q3 = next(item for item in enqueued["snapshot"]["questions"] if item["question_id"] == "q3")
 
-    assert main(["scheduler-tick", str(root)]) == 0
-    assert json.loads(capsys.readouterr().out)["snapshot"]["questions"][0]["state"] == "ACTIVE"
+    assert main([
+        "scheduler-heartbeat",
+        str(root),
+        "q3",
+        "--owner-id",
+        q3["lease"]["owner_id"],
+        "--lease-id",
+        q3["lease"]["lease_id"],
+        "--generation",
+        str(q3["generation"]),
+    ]) == 0
+    heartbeat = json.loads(capsys.readouterr().out)
+    assert next(item for item in heartbeat["questions"] if item["question_id"] == "q3")["state"] == "LEASED"
     assert main(["scheduler-status", str(root)]) == 0
-    assert json.loads(capsys.readouterr().out)["questions"][0]["question_id"] == "q1"
+    assert len(json.loads(capsys.readouterr().out)["questions"]) == 32
 
 
-def test_scheduler_limit_command_persists_dynamic_teacher_limit(tmp_path, capsys) -> None:
+def test_scheduler_limit_command_reports_fixed_three_slots(tmp_path, capsys) -> None:
     root = tmp_path / "scheduler"
 
-    assert main(["scheduler-set-limit", str(root), "9"]) == 0
+    assert main(["scheduler-set-limit", str(root), "3"]) == 0
 
     result = json.loads(capsys.readouterr().out)
-    assert result["snapshot"]["max_active"] == 9
+    assert result["snapshot"]["max_active"] == 3
     assert main(["scheduler-status", str(root)]) == 0
-    assert json.loads(capsys.readouterr().out)["max_active"] == 9
+    assert json.loads(capsys.readouterr().out)["max_active"] == 3
+
+
+def test_scheduler_wait_and_resume_commands_release_slot(tmp_path, capsys) -> None:
+    run = tmp_path / "run"
+    RunStore(run).initialize("q3")
+    prompt = tmp_path / "teacher.md"
+    prompt.write_text("[TASKFOUNDRY ROLE=teacher]\n继续正式出题。\n")
+    root = tmp_path / "scheduler"
+    main([
+        "scheduler-enqueue",
+        str(root),
+        "q3",
+        str(run),
+        "--teacher-thread-id",
+        "teacher-thread",
+        "--teacher-prompt",
+        str(prompt),
+    ])
+    q3 = next(
+        item
+        for item in json.loads(capsys.readouterr().out)["snapshot"]["questions"]
+        if item["question_id"] == "q3"
+    )
+
+    assert main([
+        "scheduler-wait-external",
+        str(root),
+        "q3",
+        "--owner-id",
+        q3["lease"]["owner_id"],
+        "--lease-id",
+        q3["lease"]["lease_id"],
+        "--generation",
+        str(q3["generation"]),
+        "--kind",
+        "HARBOR",
+        "--external-id",
+        "job-3",
+        "--phase",
+        "FRESH_BLIND",
+    ]) == 0
+    waited = json.loads(capsys.readouterr().out)
+    assert waited["released"] == ["q3"]
+
+    assert main([
+        "scheduler-resume-external",
+        str(root),
+        "q3",
+        "--external-id",
+        "job-3",
+    ]) == 0
+    resumed = json.loads(capsys.readouterr().out)
+    item = next(value for value in resumed["snapshot"]["questions"] if value["question_id"] == "q3")
+    assert item["state"] == "LEASED"
+
+
+def test_scheduler_cli_binds_validated_family_before_marking_complete(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    validated: list[tuple[int, Path]] = []
+
+    def validate_family(question: int, family: Path) -> None:
+        validated.append((question, family))
+
+    monkeypatch.setattr(scheduler_module, "_default_validate_published_family", validate_family)
+    run = tmp_path / "run"
+    RunStore(run).initialize("q3")
+    prompt = tmp_path / "teacher.md"
+    prompt.write_text("[TASKFOUNDRY ROLE=teacher]\n继续正式出题。\n")
+    family = tmp_path / "questions" / "3" / "new-question" / "family"
+    family.mkdir(parents=True)
+    root = tmp_path / "scheduler"
+    assert main([
+        "scheduler-enqueue",
+        str(root),
+        "q3",
+        str(run),
+        "--teacher-thread-id",
+        "teacher-thread",
+        "--teacher-prompt",
+        str(prompt),
+    ]) == 0
+    enqueued = json.loads(capsys.readouterr().out)
+    q3 = next(item for item in enqueued["snapshot"]["questions"] if item["question_id"] == "q3")
+    store = RunStore(run)
+    current = store.read_snapshot()
+    assert current is not None
+    store.commit(
+        actor=Actor.SYSTEM,
+        event_type="test.state.changed",
+        idempotency_key="test:q3:completed",
+        payload={},
+        snapshot=store.advance(current, state=RunState.COMPLETED),
+    )
+
+    assert main(["scheduler-tick", str(root)]) == 0
+    waiting = json.loads(capsys.readouterr().out)
+    q3 = next(item for item in waiting["snapshot"]["questions"] if item["question_id"] == "q3")
+    assert q3["state"] == "LEASED"
+    assert q3["phase"] == "RUN_COMPLETED_AWAITING_PUBLICATION"
+
+    assert main([
+        "scheduler-bind-published-family",
+        str(root),
+        "q3",
+        str(family),
+        "--owner-id",
+        q3["lease"]["owner_id"],
+        "--lease-id",
+        q3["lease"]["lease_id"],
+        "--generation",
+        str(q3["generation"]),
+    ]) == 0
+    completed = json.loads(capsys.readouterr().out)
+    q3 = next(item for item in completed["snapshot"]["questions"] if item["question_id"] == "q3")
+    assert q3["state"] == "COMPLETED"
+    assert q3["published_family"] == str(family.resolve())
+    assert validated == [(3, family.resolve())]
 
 
 def test_harbor_queue_commands_submit_and_claim_independent_job(tmp_path, capsys) -> None:
@@ -572,24 +772,89 @@ def test_labwright_delta_cli_round_trip(tmp_path, capsys) -> None:
         "--fencing-token",
         "fence-1",
     ]) == 0
-    assert json.loads(capsys.readouterr().out)["request_id"] == "delta-1"
+    claim = json.loads(capsys.readouterr().out)
+    assert claim["request_id"] == "delta-1"
 
     runtime = tmp_path / "runtime.json"
     runtime.write_text(json.dumps({
-        "request_id": "runtime-1",
-        "sandbox_id": "sandbox-1",
+        "request_id": "builder-runtime-1",
+        "sandbox_id": "builder-sandbox-1",
         "artifact": {
             "provider": "lbg",
             "endpoint_identity": "lbg://production",
             "project_id": "42",
-            "record_id": "1",
-            "image_url": "registry/task:fixed",
+            "record_id": "builder-1",
+            "image_url": "registry/labwright:fixed",
+            "digest": "sha256:" + "c" * 64,
         },
         "started_at": "2026-08-24T00:00:00+00:00",
         "status": "READY",
     }))
+    inventory_before = tmp_path / "inventory-before.json"
+    inventory_before.write_text('{"packages":[]}')
+    inventory_after = tmp_path / "inventory-after.json"
+    inventory_after.write_text('{"packages":["scipy==1.14.0"]}')
+    probes = tmp_path / "probes.json"
+    probes.write_text('{"import_scipy":true}')
+    builder_artifact = json.loads(runtime.read_text())["artifact"]
+    baseline_artifact = {
+        "provider": "lbg",
+        "endpoint_identity": "lbg://production",
+        "project_id": "42",
+        "record_id": "1",
+        "image_url": "registry/task:fixed",
+        "digest": "sha256:" + "a" * 64,
+    }
+    source_trace = tmp_path / "source-failure-trace.json"
+    source_trace.write_text(json.dumps({
+        "schema_version": 1,
+        "classification": "ENVIRONMENT_FAILURE",
+        "run_id": "run-1",
+        "question_revision": "r1",
+        "package_sha256": "b" * 64,
+        "researcher_request_id": "researcher-1",
+        "sandbox_id": "sandbox-1",
+        "baseline_identity_sha256": artifact_identity_sha256(
+            ArtifactIdentity(**baseline_artifact)
+        ),
+    }))
     evidence = tmp_path / "evidence.json"
-    evidence.write_text('{"scipy":"1.14.0"}')
+    evidence.write_text(json.dumps({
+        "schema_version": 2,
+        "run_id": "run-1",
+        "question_revision": "r1",
+        "package_sha256": "b" * 64,
+        "researcher_request_id": "researcher-1",
+        "sandbox_id": "sandbox-1",
+        "request_sha256": claim["request_sha256"],
+        "baseline_artifact": baseline_artifact,
+        "baseline_identity_sha256": artifact_identity_sha256(
+            ArtifactIdentity(**baseline_artifact)
+        ),
+        "builder_runtime_request_id": "builder-runtime-1",
+        "builder_sandbox_id": "builder-sandbox-1",
+        "builder_identity_sha256": artifact_identity_sha256(
+            ArtifactIdentity(**builder_artifact)
+        ),
+        "capability_name": "scipy",
+        "capability_version": "1.14.0",
+        "source_trace": {
+            "path": str(source_trace),
+            "sha256": hashlib.sha256(source_trace.read_bytes()).hexdigest(),
+        },
+        "inventory_before": {
+            "path": str(inventory_before),
+            "sha256": hashlib.sha256(inventory_before.read_bytes()).hexdigest(),
+        },
+        "inventory_after": {
+            "path": str(inventory_after),
+            "sha256": hashlib.sha256(inventory_after.read_bytes()).hexdigest(),
+        },
+        "probes": {
+            "path": str(probes),
+            "sha256": hashlib.sha256(probes.read_bytes()).hexdigest(),
+        },
+    }))
     assert main([
         "labwright-complete-delta",
         str(root),
@@ -603,13 +868,31 @@ def test_labwright_delta_cli_round_trip(tmp_path, capsys) -> None:
     ]) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "READY"
 
+    baseline_runtime = tmp_path / "baseline-runtime.json"
+    baseline_runtime.write_text(json.dumps({"artifact": baseline_artifact}))
+    scientific_trace = tmp_path / "scientific-trace.json"
+    scientific_trace.write_text(json.dumps({
+        "schema_version": 1,
+        "classification": "SCIENTIFIC_RESULT",
+        "run_id": "run-1",
+        "question_revision": "r1",
+        "package_sha256": "b" * 64,
+        "researcher_request_id": "fresh-retry-request-1",
+        "sandbox_id": "fresh-retry-sandbox-1",
+        "baseline_identity_sha256": artifact_identity_sha256(
+            ArtifactIdentity(**baseline_artifact)
+        ),
+        "runtime_delta_request_ids": ["delta-1"],
+    }))
     plan = tmp_path / "seal-plan.json"
     assert main([
         "labwright-seal-plan",
         str(root),
         "run-1",
         "r1",
-        "a" * 64,
+        "b" * 64,
+        str(baseline_runtime),
+        str(scientific_trace),
         str(plan),
         "--request-id",
         "delta-1",
@@ -618,7 +901,7 @@ def test_labwright_delta_cli_round_trip(tmp_path, capsys) -> None:
     assert plan.is_file()
 
 
-def test_accept_bound_health_command(tmp_path, capsys) -> None:
+def test_accept_bound_health_command_rejects_legacy_environment(tmp_path, capsys) -> None:
     run = tmp_path / "run"
     run.mkdir()
     (run / "state.json").write_text(json.dumps({
@@ -650,13 +933,11 @@ def test_accept_bound_health_command(tmp_path, capsys) -> None:
     bundle_path = tmp_path / "bound-health.json"
     bundle_path.write_text(json.dumps(bundle.to_dict()))
 
-    assert main(["accept-bound-health", str(run), str(bundle_path)]) == 0
-    result = json.loads(capsys.readouterr().out)
-    assert result["state"] == "ORACLE_PASSED"
-    assert result["evidence"]["bound_health"]["question_revision"] == "r1"
+    with pytest.raises(RuntimeError, match="runtime closure"):
+        main(["accept-bound-health", str(run), str(bundle_path)])
 
 
-def test_accept_bound_health_command_after_runtime_trace(tmp_path, capsys) -> None:
+def test_accept_bound_health_command_requires_closure_even_after_trace(tmp_path, capsys) -> None:
     run = tmp_path / "run"
     run.mkdir()
     (run / "state.json").write_text(json.dumps({
@@ -690,11 +971,8 @@ def test_accept_bound_health_command_after_runtime_trace(tmp_path, capsys) -> No
     bundle_path = tmp_path / "runtime-bound-health.json"
     bundle_path.write_text(json.dumps(bundle.to_dict()))
 
-    assert main(["accept-bound-health", str(run), str(bundle_path)]) == 0
-
-    result = json.loads(capsys.readouterr().out)
-    assert result["state"] == "BLIND_VALIDATION"
-    assert result["evidence"]["bound_health"]["question_revision"] == "r2"
+    with pytest.raises(RuntimeError, match="runtime closure"):
+        main(["accept-bound-health", str(run), str(bundle_path)])
 
 
 def test_legacy_health_and_blind_commands_remain_compatible(tmp_path, capsys) -> None:
@@ -726,3 +1004,25 @@ def test_legacy_health_and_blind_commands_remain_compatible(tmp_path, capsys) ->
 
     assert main(["start-blind", str(run)]) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "BLIND_VALIDATION"
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ('{"oracle_full_score":true,"oracle_full_score":true}', "duplicate key"),
+        ('{"oracle_full_score":NaN}', "non-finite number"),
+    ],
+)
+def test_cli_json_inputs_fail_closed_on_ambiguous_numbers_and_keys(
+    tmp_path: Path,
+    payload: str,
+    message: str,
+) -> None:
+    """所有 CLI JSON 入口必须拒绝重复键和非有限常量。"""
+    run = tmp_path / "run"
+    run.mkdir()
+    health = tmp_path / "health.json"
+    health.write_text(payload)
+
+    with pytest.raises(SystemExit, match=message):
+        main(["accept-health", str(run), str(health), "--evidence-ref", "evidence.json"])

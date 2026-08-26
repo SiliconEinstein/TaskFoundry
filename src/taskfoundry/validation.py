@@ -124,7 +124,19 @@ def decide_validation(
             or not all(item.leakage_free for item in scientific)
         ):
             return ValidationDecision("BLOCKED_HEALTH", "difficulty passed but a health gate failed", len(blind), consecutive_timeouts)
-        return ValidationDecision("COMPLETE", "three blind failures and a healthy hinted pass", len(blind), consecutive_timeouts)
+        return ValidationDecision(
+            "VALIDATION_PASSED",
+            "three blind failures and a healthy hinted pass",
+            len(blind),
+            consecutive_timeouts,
+        )
+    if len(hinted) >= 2:
+        return ValidationDecision(
+            "HUMAN_REVIEW",
+            "two reviewed non-answer hints did not establish solvability",
+            len(blind),
+            consecutive_timeouts,
+        )
     return ValidationDecision("NEXT_HINT", "blind gate passed; issue the next reviewed non-answer hint", len(blind), consecutive_timeouts)
 
 
@@ -139,11 +151,22 @@ def _validate_freshness(attempts: list[AttemptEvidence]) -> None:
         values = [getattr(item, field) for item in scientific]
         if len(values) != len(set(values)):
             raise ContractError(f"scientific attempts must use fresh {field}")
+    modes = [item.mode for item in scientific]
+    first_hint = next((index for index, mode in enumerate(modes) if mode == "hint"), len(modes))
+    if first_hint < len(modes) and (
+        first_hint != 3 or any(mode == "blind" for mode in modes[first_hint:])
+    ):
+        raise ContractError("hint attempts require exactly three preceding scientific blinds")
+    if len([mode for mode in modes if mode == "blind"]) > 3:
+        raise ContractError("only three scientific blind attempts are allowed")
     blind_indexes = [item.attempt_index for item in scientific if item.mode == "blind"]
     if blind_indexes != list(range(1, len(blind_indexes) + 1)):
         raise ContractError("blind attempt indexes must be contiguous from one")
-    if any(item.mode == "blind" for item in scientific[3:]):
-        raise ContractError("blind attempts cannot continue after the first three scientific blinds")
+    hint_indexes = [item.attempt_index for item in scientific if item.mode == "hint"]
+    if hint_indexes != list(range(1, len(hint_indexes) + 1)):
+        raise ContractError("hint attempt indexes must be contiguous from one")
+    if len(hint_indexes) > 2:
+        raise ContractError("at most two reviewed hint attempts are allowed")
 
 
 def _consecutive_timeouts(attempts: list[AttemptEvidence]) -> int:

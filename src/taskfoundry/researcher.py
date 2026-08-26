@@ -14,7 +14,7 @@ import subprocess
 from typing import Any
 from enum import StrEnum
 
-from .harbor import DshRuntime, ResearcherRuntime, command_for
+from .harbor import ResearcherRuntime, command_for
 from .model import Actor, ContractError
 from .package import package_sha256
 
@@ -70,6 +70,8 @@ class ResearcherRequest:
         """约束冻结字节、角色目标、正式模型和时间预算。"""
         if self.mode not in {"blind", "hint"} or self.attempt_index < 1:
             raise ContractError("invalid Researcher attempt mode or index")
+        if self.mode == "blind" and self.context_digests:
+            raise ContractError("blind attempts require empty context")
         if self.mode == "hint" and not self.context_digests:
             raise ContractError("hint attempts require reviewed context evidence")
         supported = {

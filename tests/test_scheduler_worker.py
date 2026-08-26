@@ -8,58 +8,103 @@ from taskfoundry.store import RunStore
 
 
 class FakeDispatcher:
+    def __init__(self) -> None:
+        self.calls = 0
+
     def queue(self, *, role, thread_id, prompt_path):
         assert role is Actor.TEACHER
         assert prompt_path.is_file()
-        return DispatchReceipt("message-1", thread_id, role)
+        self.calls += 1
+        return DispatchReceipt(f"message-{self.calls}", thread_id, role)
 
 
-def test_worker_dispatches_active_unacknowledged_question(tmp_path: Path) -> None:
+class FailingDispatcher:
+    def queue(self, *, role, thread_id, prompt_path):
+        raise RuntimeError("control plane unavailable")
+
+
+def _configured_scheduler(tmp_path: Path) -> QuestionScheduler:
     run = tmp_path / "run"
-    RunStore(run).initialize("q1")
+    RunStore(run).initialize("q3")
     prompt = tmp_path / "teacher.md"
     prompt.write_text("[TASKFOUNDRY ROLE=teacher]\n继续正式出题。\n")
     scheduler = QuestionScheduler(tmp_path / "scheduler")
     scheduler.enqueue(
-        "q1",
+        "q3",
         run,
         teacher_thread_id="teacher-thread",
         teacher_prompt_path=prompt,
     )
+    return scheduler
 
-    outcomes = SchedulerWorker(scheduler, FakeDispatcher()).run_once()
+
+def test_worker_dispatches_one_atomically_claimed_lease(tmp_path: Path) -> None:
+    scheduler = _configured_scheduler(tmp_path)
+    dispatcher = FakeDispatcher()
+
+    outcomes = SchedulerWorker(scheduler, dispatcher, worker_id="worker-a").run_once()
 
     assert outcomes[0].status == "DISPATCHED"
-    item = scheduler.snapshot().questions[0]
-    assert item.state is QueueState.ACTIVE
-    assert item.dispatch_message_id == "message-1"
+    item = next(value for value in scheduler.snapshot().questions if value.question_id == "q3")
+    assert item.state is QueueState.LEASED
+    assert item.lease is not None and item.lease.dispatch_message_id == "message-1"
 
 
-def test_worker_does_not_repeat_acknowledged_dispatch(tmp_path: Path) -> None:
+def test_two_workers_do_not_repeat_same_dispatch(tmp_path: Path) -> None:
+    scheduler = _configured_scheduler(tmp_path)
+    dispatcher = FakeDispatcher()
+    first = SchedulerWorker(scheduler, dispatcher, worker_id="worker-a")
+    second = SchedulerWorker(scheduler, dispatcher, worker_id="worker-b")
+
+    assert first.run_once()[0].status == "DISPATCHED"
+    assert second.run_once() == ()
+    assert dispatcher.calls == 1
+
+
+def test_unconfigured_question_does_not_consume_slot(tmp_path: Path) -> None:
     run = tmp_path / "run"
-    RunStore(run).initialize("q1")
-    prompt = tmp_path / "teacher.md"
-    prompt.write_text("[TASKFOUNDRY ROLE=teacher]\n继续正式出题。\n")
+    RunStore(run).initialize("q3")
     scheduler = QuestionScheduler(tmp_path / "scheduler")
-    scheduler.enqueue(
-        "q1",
-        run,
-        teacher_thread_id="teacher-thread",
-        teacher_prompt_path=prompt,
-    )
-    worker = SchedulerWorker(scheduler, FakeDispatcher())
-    worker.run_once()
+    scheduler.enqueue("q3", run)
 
-    assert worker.run_once() == ()
+    outcomes = SchedulerWorker(scheduler, FakeDispatcher(), worker_id="worker-a").run_once()
+
+    assert outcomes == ()
+    item = next(value for value in scheduler.snapshot().questions if value.question_id == "q3")
+    assert item.state is QueueState.READY
+    assert item.lease is None
 
 
-def test_worker_requires_recovery_without_dispatch_config(tmp_path: Path) -> None:
-    run = tmp_path / "run"
-    RunStore(run).initialize("q1")
-    scheduler = QuestionScheduler(tmp_path / "scheduler")
-    scheduler.enqueue("q1", run)
+def test_dispatch_failure_releases_lease_for_recovery(tmp_path: Path) -> None:
+    scheduler = _configured_scheduler(tmp_path)
 
-    outcomes = SchedulerWorker(scheduler, FakeDispatcher()).run_once()
+    outcomes = SchedulerWorker(
+        scheduler,
+        FailingDispatcher(),
+        worker_id="worker-a",
+    ).run_once()
 
     assert outcomes[0].status == "RECOVERY_REQUIRED"
-    assert scheduler.snapshot().questions[0].state is QueueState.RECOVERY_REQUIRED
+    item = next(value for value in scheduler.snapshot().questions if value.question_id == "q3")
+    assert item.state is QueueState.RECOVERY_REQUIRED
+    assert item.lease is None
+
+
+def test_worker_skips_lease_lost_to_another_dispatch_worker(tmp_path: Path) -> None:
+    scheduler = _configured_scheduler(tmp_path)
+
+    class LostRaceScheduler:
+        def tick(self):
+            return scheduler.tick()
+
+        def claim_dispatch(self, question_id, *, worker_id):
+            assert question_id == "q3"
+            return None
+
+    outcomes = SchedulerWorker(
+        LostRaceScheduler(),  # type: ignore[arg-type]
+        FakeDispatcher(),
+        worker_id="worker-b",
+    ).run_once()
+
+    assert outcomes == ()

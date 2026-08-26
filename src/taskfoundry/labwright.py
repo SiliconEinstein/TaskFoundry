@@ -90,6 +90,8 @@ class EnvironmentReceipt:
     manifest_path: str
     manifest_sha256: str
     resource_digests: tuple[str, ...]
+    runtime_closure_path: str | None = None
+    runtime_closure_sha256: str | None = None
     schema_version: int = 1
 
     def validate(self) -> None:
@@ -101,6 +103,21 @@ class EnvironmentReceipt:
             raise ContractError("environment workdir must be absolute")
         if not re_full_hex(self.environment_key) or not re_full_hex(self.manifest_sha256):
             raise ContractError("environment and manifest keys must be SHA-256")
+        closure = (self.runtime_closure_path, self.runtime_closure_sha256)
+        if self.schema_version == 1 and any(value is not None for value in closure):
+            raise ContractError("legacy environment receipts cannot bind runtime closure")
+        if self.schema_version == 2:
+            if not all(isinstance(value, str) and value for value in closure):
+                raise ContractError("runtime-first Stable receipt requires runtime closure")
+            assert self.runtime_closure_path is not None
+            assert self.runtime_closure_sha256 is not None
+            if not re_full_hex(self.runtime_closure_sha256):
+                raise ContractError("runtime closure key must be SHA-256")
+            closure_path = Path(self.runtime_closure_path)
+            if not closure_path.is_file() or sha256_file(closure_path) != self.runtime_closure_sha256:
+                raise ContractError("runtime closure changed after Stable import")
+        elif self.schema_version != 1:
+            raise ContractError("unsupported environment receipt schema")
 
     def to_dict(self) -> dict[str, Any]:
         """返回可写入 JSON 的回执。"""
@@ -198,6 +215,7 @@ class FileLabwrightRegistry:
         key = self._environment_key(artifact, manifest_digest)
         self._verify_clean_evidence(clean_evidence_path, artifact)
         self._promote(key, manifest_digest, clean_evidence_path, fencing_token)
+        closure_path, closure_sha256 = self._runtime_closure(manifest)
         receipt = EnvironmentReceipt(
             environment_key=key,
             lifecycle="STABLE",
@@ -206,6 +224,9 @@ class FileLabwrightRegistry:
             manifest_path=str(manifest_path.resolve()),
             manifest_sha256=manifest_digest,
             resource_digests=tuple(sorted(item["sha256"] for item in manifest.get("resources", []))),
+            runtime_closure_path=closure_path,
+            runtime_closure_sha256=closure_sha256,
+            schema_version=2 if closure_path is not None else 1,
         )
         receipt.validate()
         target = self.environments / f"{receipt.environment_key}.json"
@@ -283,6 +304,22 @@ class FileLabwrightRegistry:
         if sha256_file(Path(receipt.manifest_path)) != receipt.manifest_sha256:
             raise LabwrightError("source manifest changed after registration")
         return receipt
+
+    @staticmethod
+    def _runtime_closure(manifest: dict[str, Any]) -> tuple[str | None, str | None]:
+        """从构建清单读取可选的 runtime-first closure 绑定。"""
+        value = manifest.get("runtime_closure")
+        if value is None:
+            return None, None
+        if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
+            raise LabwrightError("runtime closure reference is invalid")
+        path_value, digest = value.get("path"), value.get("sha256")
+        if not isinstance(path_value, str) or not isinstance(digest, str) or not re_full_hex(digest):
+            raise LabwrightError("runtime closure reference is invalid")
+        path = Path(path_value)
+        if not path.is_file() or sha256_file(path) != digest:
+            raise LabwrightError("runtime closure changed before Stable import")
+        return str(path.resolve()), digest
 
     def request_delta(self, actor: Actor, request: EnvironmentDeltaRequest) -> Path:
         """持久化交给 Labwright 处理的类型化增量请求。"""

@@ -88,6 +88,11 @@ def test_hint_requires_reviewed_context(tmp_path) -> None:
         request(tmp_path, mode="hint").validate()
 
 
+def test_blind_requires_empty_context(tmp_path) -> None:
+    with pytest.raises(ContractError, match="empty context"):
+        request(tmp_path, context_digests=("a" * 64,)).validate()
+
+
 def write_result(job_dir, *, errors=0, exception=None, reward=0.4):
     job_dir.mkdir(parents=True)
     evaluation = {"metrics": [{"mean": reward}], "exception_stats": {}}

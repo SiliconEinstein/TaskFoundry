@@ -31,15 +31,59 @@ def attempt(index, *, mode="blind", score=0.4, classification="SCIENTIFIC_RESULT
     return AttemptEvidence(**(values | changes))
 
 
-def test_three_blind_failures_then_hint_pass_completes() -> None:
+def test_three_blind_failures_then_hint_passes_validation() -> None:
     attempts = [attempt(1), attempt(2), attempt(3)]
     assert decide_validation(attempts, HEALTHY).action == "NEXT_HINT"
     attempts.append(attempt(1, mode="hint", score=0.9))
-    assert decide_validation(attempts, HEALTHY, final_health_bound=True).action == "COMPLETE"
+    assert decide_validation(attempts, HEALTHY, final_health_bound=True).action == "VALIDATION_PASSED"
 
 
 def test_blind_pass_is_too_easy() -> None:
     assert decide_validation([attempt(1, score=0.85)], HEALTHY).action == "TOO_EASY"
+
+
+def test_score_just_below_threshold_continues_blind() -> None:
+    assert decide_validation([attempt(1, score=0.849999)], HEALTHY).action == "NEXT_BLIND"
+
+
+def test_hint_before_three_scientific_blinds_is_rejected() -> None:
+    with pytest.raises(ContractError, match="exactly three preceding"):
+        decide_validation([attempt(1), attempt(1, mode="hint", score=0.9)], HEALTHY)
+
+
+def test_fourth_scientific_blind_is_rejected() -> None:
+    with pytest.raises(ContractError, match="only three"):
+        decide_validation([attempt(1), attempt(2), attempt(3), attempt(4)], HEALTHY)
+
+
+def test_hint_indexes_must_be_contiguous() -> None:
+    evidence = [attempt(1), attempt(2), attempt(3), attempt(2, mode="hint", score=0.7)]
+    with pytest.raises(ContractError, match="hint attempt indexes"):
+        decide_validation(evidence, HEALTHY)
+
+
+def test_two_failed_reviewed_hints_require_human_review() -> None:
+    evidence = [
+        attempt(1),
+        attempt(2),
+        attempt(3),
+        attempt(1, mode="hint", score=0.7),
+        attempt(2, mode="hint", score=0.8),
+    ]
+    assert decide_validation(evidence, HEALTHY).action == "HUMAN_REVIEW"
+
+
+def test_third_hint_is_rejected() -> None:
+    evidence = [
+        attempt(1),
+        attempt(2),
+        attempt(3),
+        attempt(1, mode="hint", score=0.7),
+        attempt(2, mode="hint", score=0.8),
+        attempt(3, mode="hint", score=0.84),
+    ]
+    with pytest.raises(ContractError, match="at most two"):
+        decide_validation(evidence, HEALTHY)
 
 
 @pytest.mark.parametrize("classification", ["ENVIRONMENT_FAILURE", "HARNESS_FAILURE", "PLATFORM_FAILURE"])

@@ -1,6 +1,6 @@
 # ADR 0007：首次解题优先与运行时 Labwright
 
-状态：2026-08-25 已由用户纠正并确认，正在实现。
+状态：2026-08-26 已实现并纳入主状态机。
 
 ## 问题与非目标
 
@@ -17,12 +17,11 @@ Researcher 将使用的依赖。Q22 在没有任何正式解题 trace 时预装 
 - 临时架构层：领域状态机、Researcher 执行、Labwright 运行时适配器、CLI/文档。
 - 第一实现切片只改变首次解题的准入顺序；Harbor/LBG 仍负责沙盒生命周期。
 
-## 当前流程
+## 被替代的旧流程
 
-`POLICIES_LOCKED → ENVIRONMENT_DISCOVERY → ENVIRONMENT_READY → AUTHORING → PACKAGE_FROZEN → BLIND_VALIDATION`
-
-Stable 镜像成为出题与首次解题的硬前置条件，运行时增量模块虽然存在，却没有
-处在正式主路径上。
+旧顺序是 `POLICIES_LOCKED → ENVIRONMENT_DISCOVERY → ENVIRONMENT_READY → AUTHORING`，
+把 Stable 镜像误设为首次解题前置。schema-v1 旧 run 可以只以显式迁移事件进入新流程；
+迁移会清除旧环境绑定，不能把它带入最终完成门。
 
 ## 决定
 
@@ -31,8 +30,9 @@ Stable 镜像成为出题与首次解题的硬前置条件，运行时增量模�
    Stable 环境不属于这一门。
 3. 首次 blind 使用固定 Paper2ARM 基础镜像立即启动 Harbor。
 4. 环境、沙盒、harness、模型连接和平台失败保持同一 attempt，均不计科学尝试。
-5. Researcher 遇到缺失公开能力时提交类型化 delta；Labwright 只在同一 Researcher
-   沙盒应用该 delta，配置期间暂停科学计时，并返回可审计回执。
+5. Researcher 遇到缺失公开能力时提交类型化失败 trace；Labwright 在独立 builder
+   runtime 中重放该公开能力缺口、应用 delta 并返回可审计回执。修复后使用 fresh
+   Researcher sandbox 重试同一科学 attempt；不要求、也不声称在线修改或恢复原沙盒。
 6. 首次有效科学解题结束后，Labwright 根据真实 delta 生成镜像固化计划；没有
    实际 delta 时不得凭 Teacher 猜测构建依赖集合。
 7. 最终完成仍要求 Stable 环境、完整 Reviewer、题包冻结、三轮 fresh blind 和
@@ -50,18 +50,46 @@ Stable 镜像成为出题与首次解题的硬前置条件，运行时增量模�
 - 首次科学 trace 和运行时 Stable 回执均已落盘后，Reviewer 可补交同时绑定当前
   题包摘要、题目修订、环境身份和证据字节的 `BoundHealthEvidence`；状态保持在
   当前 blind/hint 阶段。
-- `COMPLETED` 必须存在当前有效的 `BoundHealthEvidence`。只有健康布尔值全真仍
-  不足以完成运行；若运行仅因此进入 `BLOCKED_HEALTH`，Reviewer 稍后补交有效
-  回执会重新计算最终门，满足条件后进入 `COMPLETED`。
+- 三盲与提示验证满足科学门后先进入 `VALIDATION_PASSED`。只有当前 revision 的
+  schema-v2 closure、Stable `EnvironmentReceipt`、完整 `BoundHealthEvidence` 和独立
+  post-validation 都重新复验通过，才进入 `COMPLETED`。
 - `ResearcherRequest` 继续绑定题包与 JobConfig；环境失败仍通过现有分类返回
   `RETRY_SAME_ATTEMPT`。
+
+### 运行时证据闭合
+
+首次 blind 的环境证据分成四段，不能再用一个预先生成的 Stable key 代替：
+
+1. **baseline**：冻结题包、Researcher request、JobConfig 和实际启动的基础镜像
+   `ArtifactIdentity`；基础镜像必须有不可变 digest。
+2. **source failure trace**：绑定同一 run、question revision、package、source Researcher
+   request/sandbox 和 baseline identity 的类型化非科学失败证据。
+3. **runtime delta**：可选。每份 `DeltaReceipt` 同时绑定 source Researcher
+   request/sandbox 与独立 Labwright builder request/sandbox/image，还必须绑定请求规范摘要、
+   题包、baseline、增量前后 inventory、验证 probes 和 source failure trace。请求认领在
+   同一 worker/fence 下幂等。恢复起止和耗时是可选的运行可观测字段，不进入科学 wall time，
+   也不表示存在 live pause/resume。
+4. **Stable closure**：`ImageSealPlan` 直接绑定 baseline artifact 和科学 trace，不再要求
+   预先存在的 Stable `environment_key`。科学 trace 来自应用已验证 delta 后启动的 fresh
+   Researcher sandbox，并列出实际使用的精确 delta request IDs。若 baseline 已足够，delta
+   列表可以为空；若有 delta，closure 内嵌回执会保留 source 与 builder 的两套运行身份。
+
+`ImageSealPlan` 是 Stable 构建输入，不是 Stable 回执。Labwright 完成构建和两个 clean
+sandbox 复验后，仍使用 `EnvironmentReceipt` 和 `BoundHealthEvidence` 进入最终门。
+旧 schema-v1 `DeltaReceipt` 与依赖 `base_environment_key` 的 seal plan 只保留为历史证据，
+不得无证据升级成 schema v2 或作为 runtime-first Stable 构建输入。
 
 ## 安全、恢复与可观测性
 
 - runtime delta 只允许公开 capability，不接受 shell、本地宿主路径或无哈希外部
   资源；Researcher 不能冒充 Labwright 完成回执。
+- delta evidence 使用严格 JSON 解码，拒绝重复键、非有限数和不完整引用；inventory、
+  probes 与原始 evidence 都按路径和 SHA-256 双重绑定。
 - Stable 镜像只能从已完成的 delta receipt 生成，禁止从隐藏 reference 或
-  Teacher 私有环境反推依赖。
+  Teacher 私有环境反推依赖。无 delta 时必须由有效科学 trace 证明 baseline 足够。
+- 同一科学 attempt 表示计数和 progression 身份不变，不表示复用同一 Harbor job、request
+  或 sandbox。失败的 source sandbox 不恢复；fresh retry 必须显式声明采用的 delta request
+  IDs，closure 据此拒绝遗漏、额外或顺序漂移的回执。
 - 旧 run 不原位重写历史事件。未发生科学尝试的 run 可追加迁移事件进入新主路径；
   已有尝试的 run 保留原协议。
 - `ENVIRONMENT_DISCOVERY → AUTHORING` 兼容迁移写入
@@ -76,13 +104,17 @@ Stable 镜像成为出题与首次解题的硬前置条件，运行时增量模�
 
 1. 无 Stable environment 时可以 Authoring、冻结题包、通过快速门并开始首次 blind。
 2. 环境失败返回同一 attempt 重试，不增加科学 blind 计数。
-3. 没有科学 trace 时不能把猜测的 delta 固化成最终镜像。
+3. 没有科学 trace 时不能创建 Stable 构建计划；baseline 已足够时允许 zero-delta
+   closure，不得为了满足 schema 人为制造增量。
 4. 完成状态仍要求 Stable environment 和全部健康门。
 5. Q22 使用基础镜像完成一次真实 Harbor blind，环境缺口只以权威 trace/receipt
    记录。
 
-## 豁免与剩余工作
+## 豁免与实现状态
 
-没有豁免。Harbor 内主动暂停 Agent、由外部 Labwright 修改同一 LBG 沙盒的完整
-控制面适配器属于后续实现切片；在此之前，环境缺失必须被分类为非科学失败并保持
-同一 attempt，不能转成科学失败或另起题目。
+没有豁免。文件适配器和 `RunWorkflow` 已闭合 baseline、source failure trace、独立 builder
+delta、fresh scientific trace、Stable 构建计划、schema-v2 环境回执、最终健康和
+post-validation。difficulty revision 会清除上一 revision 的环境、健康、closure、hint 与
+package evidence，禁止跨修订借用。控制面不实现 live same-sandbox pause/resume；source
+sandbox 终止后必须用已验证 delta 启动 fresh Researcher sandbox，并把实际 delta IDs 写入
+科学 trace。环境缺失不能转成科学失败或另起题目。

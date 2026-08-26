@@ -5,7 +5,9 @@ __pycache__/
 htmlcov/
 .venv/
 runs/
+archive/
 archives/
+workbench/
 harbor-queue/
 scheduler/
 smoke/harbor-jobs/

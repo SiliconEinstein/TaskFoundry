@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://taskfoundry.local/schemas/final-question-family-v1.json",
+  "title": "TaskFoundry 最终题族 manifest v1",
+  "oneOf": [
+    {"$ref": "#/$defs/standardFamily"},
+    {"$ref": "#/$defs/grandfatheredFamily"}
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "scientificContractSha256": {
+      "allOf": [{"$ref": "#/$defs/sha256"}],
+      "description": "Validator-computed digest of canonical SCIENTIFIC_CONTRACT.json after re-hashing every GT, grader and output-contract file plus tolerance and weights."
+    },
+    "questionId": {"type": "string", "pattern": "^Q(0[1-9]|[12][0-9]|3[0-2])$"},
+    "familySlug": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+    "scientificObjective": {"type": "string", "minLength": 20},
+    "sealedEvidence": {
+      "type": "object",
+      "description": "A byte-bound evidence link. Publication validation reopens and semantically validates the target; the digest alone is never sufficient.",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^/personal/TaskFoundry/"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "blind": {
+      "type": "object",
+      "description": "Evidence must bind a schema-v1 Researcher request, its CONSUMED capability, context_digests=[], and fresh job/trial/sandbox/session fields.",
+      "additionalProperties": false,
+      "required": ["score", "evidence"],
+      "properties": {
+        "score": {"type": "number", "minimum": 0, "exclusiveMaximum": 0.85},
+        "evidence": {"$ref": "#/$defs/sealedEvidence"}
+      }
+    },
+    "hint": {
+      "type": "object",
+      "description": "The review and result evidence use workflow mode=hint and carry contiguous hint_index plus parent_hint_sha256 ordering.",
+      "additionalProperties": false,
+      "required": ["score", "review_seal", "result_evidence"],
+      "properties": {
+        "score": {"type": "number", "minimum": 0.85, "maximum": 1},
+        "review_seal": {"$ref": "#/$defs/sealedEvidence"},
+        "result_evidence": {"$ref": "#/$defs/sealedEvidence"}
+      }
+    },
+    "hardLevel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "package_sha256",
+        "scientific_contract_sha256",
+        "formal_reviewer",
+        "oracle_validation",
+        "honest_validation",
+        "fresh_blinds",
+        "successful_hint",
+        "runtime_closure",
+        "post_validation"
+      ],
+      "properties": {
+        "status": {"const": "PASS_FINAL_PROGRESSION"},
+        "package_sha256": {"$ref": "#/$defs/sha256"},
+        "scientific_contract_sha256": {"$ref": "#/$defs/scientificContractSha256"},
+        "formal_reviewer": {"$ref": "#/$defs/sealedEvidence"},
+        "oracle_validation": {"$ref": "#/$defs/sealedEvidence"},
+        "honest_validation": {"$ref": "#/$defs/sealedEvidence"},
+        "fresh_blinds": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {"$ref": "#/$defs/blind"}
+        },
+        "successful_hint": {"$ref": "#/$defs/hint"},
+        "runtime_closure": {
+          "allOf": [{"$ref": "#/$defs/sealedEvidence"}],
+          "description": "Semantically validated ImageSealPlan + schema-v2 EnvironmentReceipt + exact environment manifest/dependency lock + immutable image + at least two clean sandboxes."
+        },
+        "post_validation": {"$ref": "#/$defs/sealedEvidence"}
+      }
+    },
+    "derivedLevel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "package_sha256",
+        "scientific_contract_sha256",
+        "derivation_hint",
+        "formal_reviewer",
+        "oracle_validation",
+        "honest_validation",
+        "fresh_harbor"
+      ],
+      "properties": {
+        "status": {"const": "PASS_FINAL_PROGRESSION"},
+        "package_sha256": {"$ref": "#/$defs/sha256"},
+        "scientific_contract_sha256": {"$ref": "#/$defs/scientificContractSha256"},
+        "derivation_hint": {"$ref": "#/$defs/hint"},
+        "formal_reviewer": {"$ref": "#/$defs/sealedEvidence"},
+        "oracle_validation": {"$ref": "#/$defs/sealedEvidence"},
+        "honest_validation": {"$ref": "#/$defs/sealedEvidence"},
+        "fresh_harbor": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Each target is a workflow-compatible hint-result evidence, never a publication-only derived mode.",
+          "items": {"$ref": "#/$defs/sealedEvidence"}
+        }
+      }
+    },
+    "standardFamily": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "publication_mode",
+        "question_id",
+        "family_slug",
+        "scientific_objective",
+        "scientific_contract_sha256",
+        "levels"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "publication_mode": {"const": "family-v1"},
+        "question_id": {"$ref": "#/$defs/questionId"},
+        "family_slug": {"$ref": "#/$defs/familySlug"},
+        "scientific_objective": {"$ref": "#/$defs/scientificObjective"},
+        "scientific_contract_sha256": {"$ref": "#/$defs/scientificContractSha256"},
+        "levels": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["hard", "medium"],
+          "properties": {
+            "hard": {"$ref": "#/$defs/hardLevel"},
+            "medium": {"$ref": "#/$defs/derivedLevel"},
+            "guided": {"$ref": "#/$defs/derivedLevel"}
+          }
+        }
+      }
+    },
+    "grandfatheredLevel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "package_sha256", "completion_evidence"],
+      "properties": {
+        "status": {"const": "PASS_GRANDFATHERED"},
+        "package_sha256": {"$ref": "#/$defs/sha256"},
+        "completion_evidence": {"$ref": "#/$defs/sealedEvidence"}
+      }
+    },
+    "grandfatheredFamily": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "publication_mode",
+        "question_id",
+        "family_slug",
+        "scientific_objective",
+        "grandfathered"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "publication_mode": {"const": "grandfathered-v1"},
+        "question_id": {"enum": ["Q01", "Q02"]},
+        "family_slug": {"$ref": "#/$defs/familySlug"},
+        "scientific_objective": {"$ref": "#/$defs/scientificObjective"},
+        "grandfathered": {"$ref": "#/$defs/grandfatheredLevel"}
+      }
+    }
+  }
+}

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 from .codex_agent import CodexDispatcher
 from .model import Actor, ContractError
 from .scheduler import QuestionScheduler, QueueState
+from .scheduler_state import DispatchState
 
 
 @dataclass(frozen=True)
@@ -27,28 +29,31 @@ class SchedulerWorker:
         self,
         scheduler: QuestionScheduler,
         dispatcher: CodexDispatcher | None = None,
+        *,
+        worker_id: str | None = None,
     ) -> None:
         self.scheduler = scheduler
         self.dispatcher = dispatcher or CodexDispatcher()
+        self.worker_id = worker_id or f"scheduler-worker:{os.getpid()}"
 
     def run_once(self) -> tuple[DispatchOutcome, ...]:
         """推进队列并派发本轮新激活题目。"""
         result = self.scheduler.tick()
-        by_id = {item.question_id: item for item in result.snapshot.questions}
         outcomes: list[DispatchOutcome] = []
         pending = tuple(
-            item.question_id
+            item
             for item in result.snapshot.questions
-            if item.state is QueueState.ACTIVE and item.dispatch_message_id is None
+            if item.state is QueueState.LEASED
+            and item.lease is not None
+            and item.lease.dispatch_state is DispatchState.PENDING
         )
-        for question_id in pending:
-            item = by_id[question_id]
-            if not item.teacher_thread_id or not item.teacher_prompt_path:
-                self.scheduler.require_recovery(question_id)
-                outcomes.append(
-                    DispatchOutcome(question_id, "RECOVERY_REQUIRED", error="Teacher dispatch is not configured")
-                )
+        for pending_item in pending:
+            item = self.scheduler.claim_dispatch(pending_item.question_id, worker_id=self.worker_id)
+            if item is None:
                 continue
+            question_id = item.question_id
+            lease = item.lease
+            assert lease is not None and item.teacher_thread_id and item.teacher_prompt_path
             try:
                 receipt = self.dispatcher.queue(
                     role=Actor.TEACHER,
@@ -56,9 +61,22 @@ class SchedulerWorker:
                     prompt_path=Path(item.teacher_prompt_path),
                 )
             except (ContractError, RuntimeError, OSError) as error:
-                self.scheduler.require_recovery(question_id)
+                self.scheduler.require_recovery(
+                    question_id,
+                    worker_id=self.worker_id,
+                    owner_id=lease.owner_id,
+                    lease_id=lease.lease_id,
+                    generation=item.generation,
+                )
                 outcomes.append(DispatchOutcome(question_id, "RECOVERY_REQUIRED", error=str(error)))
                 continue
-            self.scheduler.record_dispatch(question_id, receipt.message_id)
+            self.scheduler.record_dispatch(
+                question_id,
+                receipt.message_id,
+                worker_id=self.worker_id,
+                owner_id=lease.owner_id,
+                lease_id=lease.lease_id,
+                generation=item.generation,
+            )
             outcomes.append(DispatchOutcome(question_id, "DISPATCHED", message_id=receipt.message_id))
         return tuple(outcomes)

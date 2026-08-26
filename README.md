@@ -10,27 +10,38 @@ Harbor 运行目录。
 
 ## 当前正式流程
 
-1. 题型模块生成 `QuestionDesignBrief`。一道题应预计在 1800 秒内可解。
-2. Teacher 锁定固定题包规范和题型规范。
-3. Teacher 完成初版题包；Reviewer 只检查题型、明显泄漏、Oracle 和 grader 的
+1. 题型模块生成 `QuestionDesignBrief`、来源角色图和 Ground Truth 账本。一道题应预计在 1800 秒内可解。
+2. Teacher 锁定题型规范、最小可运行题包和固定基础镜像合同。
+3. Reviewer 检查题型、明显泄漏、Oracle、grader 和
    首次解题安全门，不等待 Stable 环境。
 4. Teacher 向独立 Researcher 签发一次性请求；Researcher 立即从固定 Paper2ARM
    基础镜像启动 Harbor。
-5. 解题过程中缺少公开能力时，Researcher 提交类型化请求，Labwright 在同一沙盒
-   配置环境；配置时间不计科学执行时间。
-6. 首次有效解题后，Teacher 根据反馈统一修题，Labwright 根据真实 delta 精简并
+5. 缺少公开能力时，保存失败 trace 并提交类型化请求；Labwright 重放基础环境与
+   delta，同一科学 attempt 使用修复后的 fresh sandbox 重试，环境失败不计科学尝试。
+6. 首次有效解题后，Teacher 只依据公开验证结果调整真实科学难度，Labwright 根据真实 delta 精简并
    固化题目镜像，不按作者侧依赖猜测镜像内容。
 7. 完整 Reviewer 验证 Oracle、诚实解、对抗样例、最终环境和无泄漏证据。
-8. 正式验证执行三轮盲解，再按需执行若干轮带提示解题。Agent 硬超时为
+8. 每个 hard revision 执行三轮独立、空策略上下文的 fresh blind；任一得分
+   `>=0.85` 即 `TOO_EASY`，修订难度后从 blind-a01 重启。三轮均低于通过线后，
+   才能运行一至两级经审核的非答案提示；提示后必须达到通过线。Agent 硬超时为
    3600 秒；达到超时后暂存该题并调度下一题。
+
+`freeze-package` 前必须先显式绑定与当前 brief/revision 一致的两份设计证据：
+
+```bash
+taskfoundry attach-design-evidence <run-dir> <source-role-map.json> <ground-truth-ledger.json>
+taskfoundry freeze-package <run-dir> <package-dir>
+```
+
+难度修订会使这两份绑定失效；修订后的题包必须重新绑定同一科学来源和 GT 合同。
 
 正常出题流程不包含 harness 或模型对比实验。历史实验可以作为旁路研究证据，
 但不得写入正式验证账本。
 
 ## 多题调度
 
-Teacher 调度器默认保持五道活动题，并在题目完成、暂存、阻塞或进入人工处理后
-自动补位。上限可以动态调整；调低时不会终止正在工作的题，只会暂停新补位：
+Teacher 调度器保持三个带 owner、generation、heartbeat 和 expiry 的 writer lease。
+Reviewer、Harbor、Labwright 或人工等待立即释放 authoring 槽位并自动补位，等待结束后重新排队；旧 `ACTIVE` 字段不再代表真实存活：
 
 ```bash
 taskfoundry scheduler-enqueue /personal/TaskFoundry/scheduler q18 \
@@ -38,7 +49,6 @@ taskfoundry scheduler-enqueue /personal/TaskFoundry/scheduler q18 \
   --teacher-thread-id <teacher-task-id> \
   --teacher-prompt /personal/TaskFoundry/runs/q18/teacher-prompt.md
 taskfoundry scheduler-work-once /personal/TaskFoundry/scheduler
-taskfoundry scheduler-set-limit /personal/TaskFoundry/scheduler 8
 taskfoundry scheduler-status /personal/TaskFoundry/scheduler
 ```
 
@@ -67,12 +77,12 @@ capability 或启动 Harbor。
 
 Labwright 有两条生命周期，运行时增量必须先于稳定镜像：
 
-- 运行时增量：Researcher 请求公开能力，Labwright 排他认领并在同一沙盒配置，
-  返回带证据的恢复回执；配置时间不计入科学执行时间。
+- 运行时增量：Researcher trace 触发公开能力请求，Labwright 排他认领并重放基础环境，
+  返回带证据的恢复回执；修复后重试同一科学 attempt，配置失败不计科学尝试。
 - 稳定镜像：首次有效解题结束后，Labwright 汇总已验证增量形成镜像固化计划，构建题目
   完整镜像，经过干净沙盒验证后登记为 Stable。
 
-普通 CPU 题使用固定 Paper2ARM 基础镜像。最终镜像包含通用 harness、题目依赖
+普通 CPU 题使用固定 Paper2ARM 基础镜像。最终镜像包含题目依赖
 和公开资源，不包含凭证、隐藏答案、测试、提示或 Researcher 轨迹。
 
 ## 题包位置
@@ -81,7 +91,11 @@ Labwright 有两条生命周期，运行时增量必须先于稳定镜像：
 必须同步到：
 
 ```text
-/personal/codex-workspace/question-from-questions/<题号>/new-question/<题目名>/
+/personal/codex-workspace/question-from-questions/<题号>/new-question/<题族>/
+  FAMILY_MANIFEST.json
+  hard/
+  medium/
+  guided/  # 可选
 ```
 
 ## 开发检查

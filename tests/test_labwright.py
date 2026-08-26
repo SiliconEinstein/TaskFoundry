@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -64,6 +65,18 @@ def clean_evidence(tmp_path):
     return path
 
 
+def attach_runtime_closure(tmp_path, manifest_path):
+    closure = tmp_path / "runtime-closure.json"
+    closure.write_text('{"schema_version":2}')
+    value = json.loads(manifest_path.read_text())
+    value["runtime_closure"] = {
+        "path": str(closure.resolve()),
+        "sha256": hashlib.sha256(closure.read_bytes()).hexdigest(),
+    }
+    manifest_path.write_text(json.dumps(value))
+    return closure
+
+
 def test_import_and_resolve_stable_manifest(tmp_path) -> None:
     registry = FileLabwrightRegistry(tmp_path / "state")
     receipt = registry.import_stable(
@@ -76,6 +89,24 @@ def test_import_and_resolve_stable_manifest(tmp_path) -> None:
         manifest(tmp_path), clean_evidence_path=clean_evidence(tmp_path), fencing_token="fence-1",
         endpoint_identity="lbg://production", project_id="42"
     ) == receipt
+
+
+def test_runtime_first_stable_receipt_binds_closure(tmp_path) -> None:
+    source = manifest(tmp_path)
+    closure = attach_runtime_closure(tmp_path, source)
+    registry = FileLabwrightRegistry(tmp_path / "state")
+
+    receipt = registry.import_stable(
+        source,
+        clean_evidence_path=clean_evidence(tmp_path),
+        fencing_token="fence-1",
+        endpoint_identity="lbg://production",
+        project_id="42",
+    )
+
+    assert receipt.schema_version == 2
+    assert receipt.runtime_closure_path == str(closure.resolve())
+    assert receipt.runtime_closure_sha256 == hashlib.sha256(closure.read_bytes()).hexdigest()
 
 
 def test_resolve_detects_manifest_drift(tmp_path) -> None:
