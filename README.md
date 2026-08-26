@@ -98,6 +98,22 @@ Labwright 有两条生命周期，运行时增量必须先于稳定镜像：
   low/  # 可选
 ```
 
+## 历史进度归档
+
+Q3–Q32 的旧题包尝试、Reviewer、Harbor、运行回执和失败归因按 trace 类型复制到
+各题的 `trace/authoring/imported-taskfoundry-runs/`，并以 SHA-256 建立逐题索引。
+原始 run 保持不动，历史 `PASS` 或 `COMPLETE` 仅作为可复用证据，不会自动写入
+`question-pack/`：
+
+```bash
+cd /personal/TaskFoundry
+PYTHONPATH=src /opt/mamba/bin/python scripts/consolidate_question_history.py
+PYTHONPATH=src /opt/mamba/bin/python scripts/consolidate_question_history.py --apply
+```
+
+全局总账位于 `question-from-questions/AUTHORING_PROGRESS.json` 和 `.md`；每道题的
+明细位于 `trace/authoring/HISTORY_INDEX.json` 和 `.md`。Q1、Q2 不在迁移范围内。
+
 ## 开发检查
 
 ```bash
