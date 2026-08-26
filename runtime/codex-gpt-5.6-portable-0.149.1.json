@@ -1,0 +1,13 @@
+{
+  "adapter_pythonpath": "/personal/TaskFoundry/src",
+  "agent_import": "taskfoundry.portable_codex_agent:PortableCodex",
+  "credential_profile": "strong",
+  "harness": "codex",
+  "model_name": "matmaster/gpt-5.6-sol",
+  "portable_binary_path": "/home/codex-work/.codex/packages/standalone/releases/0.149.1-x86_64-unknown-linux-musl/bin/codex",
+  "portable_binary_sha256": "73dc5888888f411c1f0fa7b81d866e721dcc86b527ce8e3b2cf4708661e823ba",
+  "portable_binary_version": "0.149.1",
+  "portable_code_mode_host_path": "/home/codex-work/.codex/packages/standalone/releases/0.149.1-x86_64-unknown-linux-musl/bin/codex-code-mode-host",
+  "portable_code_mode_host_sha256": "48f3a0d48033039cc7caccd209edb0ee350b81f82ca851a7b129e146e4bec6fb",
+  "reasoning_effort": "high"
+}

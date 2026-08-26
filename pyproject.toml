@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taskfoundry"
+version = "0.1.0"
+description = "Evidence-driven agent loop for scientific task authoring"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[project.scripts]
+taskfoundry = "taskfoundry.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["taskfoundry"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true

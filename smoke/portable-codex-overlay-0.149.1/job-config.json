@@ -1,0 +1,41 @@
+{
+  "agents": [
+    {
+      "env": {
+        "ALL_PROXY": "${STRONG_PROXY}",
+        "HTTPS_PROXY": "${STRONG_PROXY}",
+        "HTTP_PROXY": "${STRONG_PROXY}",
+        "OPENAI_API_KEY": "${STRONG_API_KEY}",
+        "OPENAI_BASE_URL": "${STRONG_BASE_URL}"
+      },
+      "kwargs": {
+        "portable_binary_path": "/home/codex-work/.codex/packages/standalone/releases/0.149.1-x86_64-unknown-linux-musl/bin/codex",
+        "portable_binary_sha256": "73dc5888888f411c1f0fa7b81d866e721dcc86b527ce8e3b2cf4708661e823ba",
+        "portable_binary_version": "0.149.1",
+        "portable_code_mode_host_path": "/home/codex-work/.codex/packages/standalone/releases/0.149.1-x86_64-unknown-linux-musl/bin/codex-code-mode-host",
+        "portable_code_mode_host_sha256": "48f3a0d48033039cc7caccd209edb0ee350b81f82ca851a7b129e146e4bec6fb",
+        "reasoning_effort": "high"
+      },
+      "model_name": "matmaster/gpt-5.6-sol",
+      "name": "taskfoundry.portable_codex_agent:PortableCodex"
+    }
+  ],
+  "debug": true,
+  "environment": {
+    "kwargs": {
+      "project_id": 2309771,
+      "sandbox_create_retries": 6,
+      "sandbox_create_retry_delay_seconds": 60
+    },
+    "type": "lbg"
+  },
+  "extra_instruction_paths": [],
+  "job_name": "portable_codex_overlay_01491_smoke01",
+  "jobs_dir": "/personal/TaskFoundry/smoke/harbor-jobs",
+  "n_concurrent_trials": 1,
+  "tasks": [
+    {
+      "path": "/personal/TaskFoundry/smoke/portable-codex-overlay-0.149.1"
+    }
+  ]
+}

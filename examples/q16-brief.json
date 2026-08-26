@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "brief_id": "q16-pde-stability-route-transfer",
+  "question_type": "method-selection",
+  "title": "Regime-aware PDE stabilization route transfer",
+  "scientific_goal": "Select a stable, accurate and efficient numerical route for unseen convection, diffusion, wave and mixed PDE regimes.",
+  "research_object": "Transfer of route-level error, oscillation, energy-drift and cost behavior across held-out physical families.",
+  "source_questions": [
+    {
+      "source_id": "cluster-2068-paper-813321821884514304",
+      "paper_id": "813321821884514304",
+      "research_goal": "Obtain a compact low-dissipation convection-diffusion scheme without spurious oscillations.",
+      "method": "compact centered convection-diffusion discretization",
+      "transferred_role": "candidate route and error/oscillation response",
+      "excluded_details": ["original example tables", "published numerical values"]
+    },
+    {
+      "source_id": "cluster-2068-paper-812136626678398976",
+      "paper_id": "812136626678398976",
+      "research_goal": "Balance discontinuity stabilization against artificial dissipation.",
+      "method": "critical DG residual viscosity",
+      "transferred_role": "robust candidate route and dissipation trade-off",
+      "excluded_details": ["single critical coefficient", "transcendental root"]
+    },
+    {
+      "source_id": "cluster-2068-paper-811861825598521344",
+      "paper_id": "811861825598521344",
+      "research_goal": "Preserve energy during long-time spectral wave integration.",
+      "method": "Crank-Nicolson Legendre-Galerkin wave solver",
+      "transferred_role": "energy-preserving candidate route and drift response",
+      "excluded_details": ["original coefficient matrices", "convergence tables"]
+    }
+  ],
+  "method_space": [
+    "compact_centered",
+    "residual_viscosity",
+    "energy_preserving_cn"
+  ],
+  "evidence_roles": {
+    "public_calibration": "complete physical families with every route observed",
+    "deployment": "unseen cases inside the declared nondimensional domain",
+    "hidden_reference": "derived route outcomes for continuous scientific scoring"
+  },
+  "public_inputs": [
+    "public_data/training_route_outcomes.csv",
+    "public_data/prediction_cases.csv",
+    "public_data/candidate_contract.json"
+  ],
+  "required_outputs": [
+    "cv_summary.csv",
+    "route_predictions.csv",
+    "recommendations.csv",
+    "method_report.json"
+  ],
+  "hidden_evaluation_axes": [
+    "held-out route prediction accuracy",
+    "feasibility classification",
+    "route objective quality",
+    "cross-output consistency"
+  ],
+  "environment_capabilities": [
+    "Python 3.12",
+    "NumPy",
+    "POSIX shell",
+    "public calibration data"
+  ],
+  "difficulty_hypothesis": "A solver must discover a transferable regime representation and cannot obtain most scientific credit from schema compliance or a single global polynomial.",
+  "solvability_argument": "Complete public families identify route behavior, and an independent coupled-regime implementation reaches full verifier credit.",
+  "non_goals": [
+    "reproduce heterogeneous paper tables directly",
+    "force a particular software implementation",
+    "hide required scientific inputs"
+  ]
+}

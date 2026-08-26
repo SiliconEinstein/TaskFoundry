@@ -1,0 +1,110 @@
+# TaskFoundry
+
+TaskFoundry 是一套用强 Agent 持续生产高难科学计算 Harbor 题目的出题框架。
+它把题目设计、规范沉淀、Teacher 出题、Labwright 环境配置和 Researcher 盲测
+拆成独立契约，同时用持久状态和证据门把它们连接起来。
+
+本项目采用 [Apache License 2.0](LICENSE)。公开仓库只包含框架源码、测试、
+文档和经过脱敏的示例，不包含实时 `runs/`、一次性 capability、内部回执或完整
+Harbor 运行目录。
+
+## 当前正式流程
+
+1. 题型模块生成 `QuestionDesignBrief`。一道题应预计在 1800 秒内可解。
+2. Teacher 锁定固定题包规范和题型规范。
+3. Teacher 完成初版题包；Reviewer 只检查题型、明显泄漏、Oracle 和 grader 的
+   首次解题安全门，不等待 Stable 环境。
+4. Teacher 向独立 Researcher 签发一次性请求；Researcher 立即从固定 Paper2ARM
+   基础镜像启动 Harbor。
+5. 解题过程中缺少公开能力时，Researcher 提交类型化请求，Labwright 在同一沙盒
+   配置环境；配置时间不计科学执行时间。
+6. 首次有效解题后，Teacher 根据反馈统一修题，Labwright 根据真实 delta 精简并
+   固化题目镜像，不按作者侧依赖猜测镜像内容。
+7. 完整 Reviewer 验证 Oracle、诚实解、对抗样例、最终环境和无泄漏证据。
+8. 正式验证执行三轮盲解，再按需执行若干轮带提示解题。Agent 硬超时为
+   3600 秒；达到超时后暂存该题并调度下一题。
+
+正常出题流程不包含 harness 或模型对比实验。历史实验可以作为旁路研究证据，
+但不得写入正式验证账本。
+
+## 多题调度
+
+Teacher 调度器默认保持五道活动题，并在题目完成、暂存、阻塞或进入人工处理后
+自动补位。上限可以动态调整；调低时不会终止正在工作的题，只会暂停新补位：
+
+```bash
+taskfoundry scheduler-enqueue /personal/TaskFoundry/scheduler q18 \
+  /personal/TaskFoundry/runs/q18 \
+  --teacher-thread-id <teacher-task-id> \
+  --teacher-prompt /personal/TaskFoundry/runs/q18/teacher-prompt.md
+taskfoundry scheduler-work-once /personal/TaskFoundry/scheduler
+taskfoundry scheduler-set-limit /personal/TaskFoundry/scheduler 8
+taskfoundry scheduler-status /personal/TaskFoundry/scheduler
+```
+
+调度状态只表示哪道题应继续推进。真正的解题仍必须通过 Researcher capability
+进入 Harbor 沙盒，不能由 Teacher 当前会话直接执行。
+
+## Harbor 并发
+
+Harbor 使用独立的全局队列，硬上限为 200 个活动 Job。每个 JobConfig 必须只有
+一个 task、一个 trial 和一个 LBG 环境，因此每项正式尝试创建独立沙盒。超过上限
+的请求保持 `WAITING`，不会丢弃或计作科学失败：
+
+```bash
+taskfoundry harbor-queue-submit /personal/TaskFoundry/harbor-queue \
+  <request-id> <job-config.json>
+taskfoundry harbor-queue-claim /personal/TaskFoundry/harbor-queue \
+  --worker-id <researcher-worker> --limit 200
+taskfoundry harbor-queue-status /personal/TaskFoundry/harbor-queue
+```
+
+正式 `researcher-run` 必须带同一共享队列根目录。没有预先认领时，它会尝试按
+FIFO 自动认领自己的请求；200 个槽位已满时仅返回 `QUEUED`，不会兑换一次性
+capability 或启动 Harbor。
+
+## Labwright
+
+Labwright 有两条生命周期，运行时增量必须先于稳定镜像：
+
+- 运行时增量：Researcher 请求公开能力，Labwright 排他认领并在同一沙盒配置，
+  返回带证据的恢复回执；配置时间不计入科学执行时间。
+- 稳定镜像：首次有效解题结束后，Labwright 汇总已验证增量形成镜像固化计划，构建题目
+  完整镜像，经过干净沙盒验证后登记为 Stable。
+
+普通 CPU 题使用固定 Paper2ARM 基础镜像。最终镜像包含通用 harness、题目依赖
+和公开资源，不包含凭证、隐藏答案、测试、提示或 Researcher 轨迹。
+
+## 题包位置
+
+运行目录中的 `question-revisions/` 是不可变验证快照，不是最终交付目录。完成题包
+必须同步到：
+
+```text
+/personal/codex-workspace/question-from-questions/<题号>/new-question/<题目名>/
+```
+
+## 开发检查
+
+```bash
+cd /personal/TaskFoundry
+/opt/mamba/bin/python -m pytest -q
+python3 /home/codex-work/.codex/skills/engineer-large-code/scripts/check_large_code.py \
+  src/taskfoundry/*.py
+```
+
+新增和修改的代码注释、公开契约说明及项目文档统一使用中文。命令、协议字段、
+模型名称和外部工具的专有名词保持原文。
+
+## Harbor 轨迹示例
+
+[`examples/harbor-trajectory/q10-survival-a01/`](examples/harbor-trajectory/q10-survival-a01/)
+收录了一次成功的 fresh Harbor blind solve 轨迹及 verifier 摘要。示例从运行目录
+单独提取并复核，不包含凭据、内部代理地址、私有 reference、receipt 或完整日志。
+
+## 架构决定
+
+- [ADR 0001](docs/decisions/0001-taskfoundry-v1.md)：TaskFoundry V1 编排模型
+- [ADR 0002](docs/decisions/0002-v1-control-plane-boundary.md)：Codex 控制面边界
+- [ADR 0003](docs/decisions/0003-codex-gpt-formal-flow.md)：Codex + GPT 正式流程
+- [ADR 0004](docs/decisions/0004-dynamic-teacher-and-harbor-concurrency.md)：动态 Teacher 与 Harbor 200 并发边界

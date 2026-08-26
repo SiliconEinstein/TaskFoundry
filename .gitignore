@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+runs/
+archives/
+harbor-queue/
+scheduler/
+smoke/harbor-jobs/
+labwright-service/checkpoint*.json
+labwright-service/*-shared-checkpoint.json
+dist/
+*.egg-info/

@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=dp-harbor-registry.cn-zhangjiakou.cr.aliyuncs.com/public/paper2arm-env
+ARG BASE_DIGEST=sha256:e56af8bcfc37be6ee859a7867ad2a3a941f9b576445a56378c6a4a5a017b57d2
+FROM ${BASE_IMAGE}@${BASE_DIGEST}
+
+# 公共层只建立文件系统合同；科学依赖和公开资产由每题 delta 固化。
+WORKDIR /app
+RUN mkdir -p /app/public_data /app/outputs
+
+# 不安装 DSH，不覆盖基础镜像已有 Codex/Claude harness。
