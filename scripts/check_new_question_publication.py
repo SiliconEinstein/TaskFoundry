@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""检查每个已发布 ``new-question`` 条目都是合法题族。"""
+"""检查每个已发布 ``question-pack`` 条目都是合法题族。"""
 
 from __future__ import annotations
 
@@ -27,9 +27,15 @@ def main() -> int:
     failures: list[str] = []
     families = 0
     for number in range(1, 33):
-        publication = QUESTION_ROOT / str(number) / "new-question"
+        numbered_root = QUESTION_ROOT / str(number)
+        legacy_publication = numbered_root / "new-question"
+        publication = (
+            legacy_publication
+            if number <= 2 and legacy_publication.is_dir()
+            else numbered_root / "question-pack"
+        )
         if not publication.is_dir():
-            failures.append(f"Q{number:02d}：缺少 new-question 目录")
+            failures.append(f"Q{number:02d}：缺少 question-pack 目录")
             continue
         entries = sorted(publication.iterdir(), key=lambda path: path.name)
         if len(entries) > 1 or (not args.allow_empty and len(entries) != 1):

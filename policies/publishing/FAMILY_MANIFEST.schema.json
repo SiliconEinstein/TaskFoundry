@@ -46,7 +46,7 @@
         "result_evidence": {"$ref": "#/$defs/sealedEvidence"}
       }
     },
-    "hardLevel": {
+    "highLevel": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -133,11 +133,11 @@
         "levels": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["hard", "medium"],
+          "required": ["high", "medium"],
           "properties": {
-            "hard": {"$ref": "#/$defs/hardLevel"},
+            "high": {"$ref": "#/$defs/highLevel"},
             "medium": {"$ref": "#/$defs/derivedLevel"},
-            "guided": {"$ref": "#/$defs/derivedLevel"}
+            "low": {"$ref": "#/$defs/derivedLevel"}
           }
         }
       }

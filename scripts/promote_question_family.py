@@ -210,13 +210,13 @@ def main() -> int:
     args = parse_args()
     manifest = validate_family(args.question, args.family)
     source_snapshot = snapshot_tree(args.family)
-    publication = QUESTION_ROOT / str(args.question) / "new-question"
+    publication = QUESTION_ROOT / str(args.question) / "question-pack"
     target = publication / manifest["family_slug"]
     print(json.dumps({"validated": True, "target": str(target)}, indent=2))
     if not args.apply:
         require_empty_publication(publication)
         return 0
-    lock_path = publication.parent / ".new-question-promotion.lock"
+    lock_path = publication.parent / ".question-pack-promotion.lock"
     with promotion_lock(lock_path):
         publish_locked(
             question=args.question,

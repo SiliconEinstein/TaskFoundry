@@ -27,6 +27,7 @@ from .researcher import (
 )
 from .scheduler import QuestionScheduler
 from .scheduler_worker import SchedulerWorker
+from .skillbank import resolve_teacher_activation, validate_latest_brief
 from .store import RunStore
 from .validation import HealthEvidence
 from .workflow import RunWorkflow
@@ -55,6 +56,14 @@ def parser() -> argparse.ArgumentParser:
     design_evidence.add_argument("run_dir", type=Path)
     design_evidence.add_argument("source_role_map", type=Path)
     design_evidence.add_argument("ground_truth_ledger", type=Path)
+
+    resolve_skill = commands.add_parser("resolve-teacher-skill")
+    resolve_skill.add_argument("question", type=int, choices=range(3, 33))
+    resolve_skill.add_argument("stage", choices=["outline", "author"])
+    resolve_skill.add_argument("attempt_id")
+
+    validate_brief = commands.add_parser("validate-question-brief")
+    validate_brief.add_argument("question", type=int, choices=range(3, 33))
 
     freeze = commands.add_parser("freeze-package")
     freeze.add_argument("run_dir", type=Path)
@@ -242,6 +251,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status": _status,
         "begin-authoring": _begin_authoring,
         "attach-design-evidence": _attach_design_evidence,
+        "resolve-teacher-skill": _resolve_teacher_skill,
+        "validate-question-brief": _validate_question_brief,
         "freeze-package": _freeze_package,
         "accept-health": _accept_health,
         "accept-bound-health": _accept_bound_health,
@@ -339,6 +350,20 @@ def _attach_design_evidence(args: argparse.Namespace) -> dict[str, Any]:
         idempotency_key=f"design:evidence:{current.question_revision}:{digest}",
     )
     return snapshot.to_dict()
+
+
+def _resolve_teacher_skill(args: argparse.Namespace) -> dict[str, Any]:
+    path = resolve_teacher_activation(args.question, args.stage, args.attempt_id)
+    return {"activation_path": str(path), "activation": _read_json(path)}
+
+
+def _validate_question_brief(args: argparse.Namespace) -> dict[str, Any]:
+    json_path, markdown_path = validate_latest_brief(args.question)
+    return {
+        "question": f"q{args.question}",
+        "json": str(json_path),
+        "markdown": str(markdown_path),
+    }
 
 
 def _accept_health(args: argparse.Namespace) -> dict[str, Any]:

@@ -1,6 +1,6 @@
 # 最终题族发布规范 v1
 
-`question-from-questions/<Q>/new-question` 是发布边界，只能包含已经完整验收的
+`question-from-questions/<Q>/question-pack` 是发布边界，只能包含已经完整验收的
 题族。创作候选、被拒题包、运行时实验、复审请求和验证 trace 必须保存在该目录
 之外。
 
@@ -11,16 +11,16 @@ Q3–Q32 必须使用 `publication_mode: family-v1`，目录结构如下：
 ```text
 <family-slug>/
 ├── FAMILY_MANIFEST.json
-├── hard/
+├── high/
 └── medium/
 ```
 
-`guided/` 可选。每一层都必须是可独立执行、可独立 lint 的 TaskFoundry 题包。
-`medium` 和 `guided` 必须保持与 `hard` 相同的科学目标、Ground Truth、grader、
+`low/` 可选。每一层都必须是可独立执行、可独立 lint 的 TaskFoundry 题包。
+`medium` 和 `low` 必须保持与 `high` 相同的科学目标、Ground Truth、grader、
 容差、权重和交付物，只能增加经独立审核的公开先验。增加行数、收紧格式、缩小
 解析容差、暴露隐藏字段或改变科学目标，都不能构成有效的难度梯度。
 
-一个标准题族必须绑定以下 `hard` 证据链：
+一个标准题族必须绑定以下 `high` 证据链：
 
 1. 独立 formal Reviewer `PASS`，并明确覆盖 grader、安全、来源、provenance 和
    同源科学合同；
@@ -33,7 +33,7 @@ Q3–Q32 必须使用 `publication_mode: family-v1`，目录结构如下：
 6. 独立 post-validation Reviewer 给出 `PASS_FINAL_PROGRESSION`。
 
 成功 hint 物化为 `medium`；如果存在更晚、不同且同样通过审核的 hint，可以物化为
-`guided`。每个派生层都必须独立满足：formal Reviewer `PASS`、Oracle `1.0`、
+`low`。每个派生层都必须独立满足：formal Reviewer `PASS`、Oracle `1.0`、
 honest solver `1.0`，以及至少一次 fresh、无泄漏、分数不低于 `0.85` 的 Harbor
 科学结果。派生层 formal evidence 必须声明 `derived_only_from_reviewed_hint=true`。
 
@@ -47,7 +47,7 @@ digest。Oracle 与 honest solver 必须是两份独立 evidence，不能用同�
 `output_contract`。前三类文件集合都用题包内相对路径和 SHA-256 绑定；validator
 会重新读取每个普通文件、复算摘要，再把实际 GT、grader、容差、权重和输出合同编码
 为 canonical JSON 计算 `scientific_contract_sha256`。manifest 或 Reviewer 自报的
-“same contract”布尔值不构成证据。`hard`、`medium` 和可选 `guided` 的实算摘要必须
+“same contract”布尔值不构成证据。`high`、`medium` 和可选 `low` 的实算摘要必须
 完全相同。
 
 整个题族内的 Harbor 执行身份必须全局唯一。`job_id`、`trial_id`、`sandbox_id` 和
@@ -58,14 +58,14 @@ capability 必须绑定 request 的实际文件 SHA 和指定 Researcher thread�
 
 Hint evidence 只使用正式 workflow 可生成的 `mode=hint`，不定义 publication-only 的
 `mode=derived`。第一条 hint 的 `hint_index=1`、`parent_hint_sha256=null`；若发布
-`guided`，其 hint 必须为 `hint_index=2`，且 parent 精确等于第一条 hint 的 SHA。
+`low`，其 hint 必须为 `hint_index=2`，且 parent 精确等于第一条 hint 的 SHA。
 review seal、hint result、Researcher request 和派生层 Harbor 结果必须对上述索引、父链
 和 context digest 给出一致绑定。`medium` 对第一条成功 hint 的引用不是新执行，不得
 重复计数。
 
 ### Runtime closure 的实质复验
 
-`hard.runtime_closure` 不是一个 `trace_backed=true` 声明。它必须链接并封签以下真实
+`high.runtime_closure` 不是一个 `trace_backed=true` 声明。它必须链接并封签以下真实
 文件，发布 validator 会逐项重新解析和验证：
 
 1. schema-v2 `ImageSealPlan`，其 scientific trace、冻结 package、基线镜像和所有
@@ -105,7 +105,7 @@ Q1 和 Q2 是唯一允许使用 `publication_mode: grandfathered-v1` 的题号�
 manifest 必须绑定 canonical JSON 的 `grandfathered-completion` evidence；该 evidence
 必须包含 `PASS_GRANDFATHERED`、`owner_attested=true`、非空
 `historical_policy_version`，以及至少一个合法的历史 evidence SHA-256。这个分支不
-接受 `hard`、`medium`、`guided` 或额外目录，也不允许 Q3–Q32 使用。
+接受 `high`、`medium`、`low` 或额外目录，也不允许 Q3–Q32 使用。
 
 ## Evidence 与晋级
 
@@ -123,7 +123,7 @@ promoter 与 publication checker 必须调用同一个共享语义 validator；J
 ```text
 workbench -> minimal preflight -> Harbor 难度验证
           -> reviewed hint progression -> trace-backed runtime closure
-          -> formal/final review -> 原子晋级 new-question
+          -> formal/final review -> 原子晋级 question-pack
 ```
 
 未完成或失败材料必须 append-only 保存在

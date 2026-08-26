@@ -28,7 +28,7 @@ from taskfoundry.researcher import ResearcherRequest  # noqa: E402
 WORKBENCH_ROOT = REPO_ROOT / "workbench"
 QUESTION_ROOT = Path("/personal/codex-workspace/question-from-questions")
 EVIDENCE_ROOT = REPO_ROOT
-LEVELS = ("hard", "medium", "guided")
+LEVELS = ("high", "medium", "low")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 TASKFOUNDRY_PYTHON = Path("/opt/mamba/bin/python")
@@ -368,7 +368,7 @@ def _formal_pass(reader: EvidenceReader, link: Any, *, package: str, level: str)
     )
     if data.get("verdict") != "PASS" or not all(data.get(key) is True for key in required_true):
         raise FamilyValidationError(f"{level}.formal_reviewer：缺少完整独立 PASS")
-    if level != "hard" and data.get("derived_only_from_reviewed_hint") is not True:
+    if level != "high" and data.get("derived_only_from_reviewed_hint") is not True:
         raise FamilyValidationError(f"{level}.formal_reviewer：缺少仅由 reviewed hint 派生的声明")
 
 
@@ -618,38 +618,38 @@ def _validate_runtime_closure(data: dict[str, Any], *, package: str, label: str)
         raise FamilyValidationError(f"{label}：环境回执、manifest 与 clean evidence 必须独立封签")
 
 
-def _validate_hard(family: Path, value: Any, reader: EvidenceReader) -> tuple[str, str, list[tuple[str, str, str, str]]]:
+def _validate_high(family: Path, value: Any, reader: EvidenceReader) -> tuple[str, str, list[tuple[str, str, str, str]]]:
     fields = {
         "status", "package_sha256", "scientific_contract_sha256", "formal_reviewer",
         "oracle_validation", "honest_validation", "fresh_blinds", "successful_hint",
         "runtime_closure", "post_validation",
     }
-    level = _require_exact_fields(value, fields, "hard")
+    level = _require_exact_fields(value, fields, "high")
     package = level["package_sha256"]
     if level["status"] != "PASS_FINAL_PROGRESSION" or level["scientific_contract_sha256"] != reader.contract_sha256 or not isinstance(package, str) or not SHA256.fullmatch(package):
-        raise FamilyValidationError("hard：最终状态、题包或科学合同绑定非法")
-    _validate_package(family, "hard", package)
-    if scientific_contract_sha256(family / "hard") != reader.contract_sha256:
-        raise FamilyValidationError("hard：scientific_contract_sha256 不是题包科学字节的实算摘要")
-    _formal_pass(reader, level["formal_reviewer"], package=package, level="hard")
-    _perfect_validation(reader, level["oracle_validation"], kind="oracle", package=package, level="hard")
-    _perfect_validation(reader, level["honest_validation"], kind="honest", package=package, level="hard")
+        raise FamilyValidationError("high：最终状态、题包或科学合同绑定非法")
+    _validate_package(family, "high", package)
+    if scientific_contract_sha256(family / "high") != reader.contract_sha256:
+        raise FamilyValidationError("high：scientific_contract_sha256 不是题包科学字节的实算摘要")
+    _formal_pass(reader, level["formal_reviewer"], package=package, level="high")
+    _perfect_validation(reader, level["oracle_validation"], kind="oracle", package=package, level="high")
+    _perfect_validation(reader, level["honest_validation"], kind="honest", package=package, level="high")
     blinds = level["fresh_blinds"]
     if not isinstance(blinds, list) or len(blinds) != 3:
-        raise FamilyValidationError("hard：必须恰好包含三次 fresh blind")
+        raise FamilyValidationError("high：必须恰好包含三次 fresh blind")
     identities: list[tuple[str, str, str, str]] = []
     for index, item in enumerate(blinds, 1):
-        blind = _require_exact_fields(item, {"score", "evidence"}, f"hard.blind{index}")
-        score = _score(blind["score"], f"hard.blind{index}.score")
+        blind = _require_exact_fields(item, {"score", "evidence"}, f"high.blind{index}")
+        score = _score(blind["score"], f"high.blind{index}.score")
         if score >= 0.85:
-            raise FamilyValidationError(f"hard.blind{index}：分数达到 TOO_EASY 阈值")
-        data = reader.read(blind["evidence"], label=f"hard.blind{index}.evidence", evidence_type="fresh-blind", package_sha256=package, level="hard")
-        if data.get("classification") != "SCIENTIFIC_RESULT" or data.get("mode") != "blind" or data.get("leakage_free") is not True or _score(data.get("score"), f"hard.blind{index}.evidence.score") != score:
-            raise FamilyValidationError(f"hard.blind{index}：科学 blind 语义不匹配")
+            raise FamilyValidationError(f"high.blind{index}：分数达到 TOO_EASY 阈值")
+        data = reader.read(blind["evidence"], label=f"high.blind{index}.evidence", evidence_type="fresh-blind", package_sha256=package, level="high")
+        if data.get("classification") != "SCIENTIFIC_RESULT" or data.get("mode") != "blind" or data.get("leakage_free") is not True or _score(data.get("score"), f"high.blind{index}.evidence.score") != score:
+            raise FamilyValidationError(f"high.blind{index}：科学 blind 语义不匹配")
         identities.append(
             _bound_researcher_execution(
                 data,
-                f"hard.blind{index}.evidence",
+                f"high.blind{index}.evidence",
                 package_sha256=package,
                 mode="blind",
                 attempt_index=index,
@@ -659,18 +659,18 @@ def _validate_hard(family: Path, value: Any, reader: EvidenceReader) -> tuple[st
     hint_sha, hint_identity = _hint(
         reader,
         level["successful_hint"],
-        label="hard.successful_hint",
+        label="high.successful_hint",
         package=package,
-        level="hard",
+        level="high",
         expected_index=1,
         expected_parent=None,
     )
     identities.append(hint_identity)
-    runtime = reader.read(level["runtime_closure"], label="hard.runtime_closure", evidence_type="runtime-closure", package_sha256=package, level="hard")
-    _validate_runtime_closure(runtime, package=package, label="hard.runtime_closure")
-    post = reader.read(level["post_validation"], label="hard.post_validation", evidence_type="post-validation", package_sha256=package, level="hard")
+    runtime = reader.read(level["runtime_closure"], label="high.runtime_closure", evidence_type="runtime-closure", package_sha256=package, level="high")
+    _validate_runtime_closure(runtime, package=package, label="high.runtime_closure")
+    post = reader.read(level["post_validation"], label="high.post_validation", evidence_type="post-validation", package_sha256=package, level="high")
     if post.get("verdict") != "PASS_FINAL_PROGRESSION" or post.get("reviewer_independent") is not True:
-        raise FamilyValidationError("hard.post_validation：缺少独立最终 PASS")
+        raise FamilyValidationError("high.post_validation：缺少独立最终 PASS")
     return package, hint_sha, identities
 
 
@@ -727,7 +727,7 @@ def _validate_derived(
     value: Any,
     reader: EvidenceReader,
     *,
-    hard_package: str,
+    high_package: str,
     expected_hint: str | None,
     expected_hint_index: int,
     expected_parent_hint: str | None,
@@ -752,13 +752,13 @@ def _validate_derived(
         reader,
         level["derivation_hint"],
         label=f"{name}.derivation_hint",
-        package=hard_package,
-        level="hard",
+        package=high_package,
+        level="high",
         expected_index=expected_hint_index,
         expected_parent=expected_parent_hint,
     )
     if expected_hint is not None and hint_sha != expected_hint:
-        raise FamilyValidationError(f"{name}：题包不是由 hard 成功 hint 派生")
+        raise FamilyValidationError(f"{name}：题包不是由 high 成功 hint 派生")
     identities = [] if expected_hint is not None else [hint_identity]
     identities.extend(
         _validate_derived_results(
@@ -832,39 +832,39 @@ def _validate_standard(family: Path, manifest: dict[str, Any], question_id: str)
     if not isinstance(contract, str) or not SHA256.fullmatch(contract):
         raise FamilyValidationError("科学合同 digest 非法")
     levels = manifest["levels"]
-    if not isinstance(levels, dict) or not {"hard", "medium"} <= set(levels) or set(levels) - set(LEVELS):
-        raise FamilyValidationError("levels 必须包含 hard 和 medium，guided 可选")
+    if not isinstance(levels, dict) or not {"high", "medium"} <= set(levels) or set(levels) - set(LEVELS):
+        raise FamilyValidationError("levels 必须包含 high 和 medium，low 可选")
     expected_children = {"FAMILY_MANIFEST.json", *levels}
     actual_children = {path.name for path in family.iterdir()}
     if actual_children != expected_children:
         raise FamilyValidationError(f"题族包含未声明条目：{sorted(actual_children ^ expected_children)}")
     reader = EvidenceReader(question_id=question_id, contract_sha256=contract)
-    hard_package, hard_hint, identities = _validate_hard(family, levels["hard"], reader)
+    high_package, high_hint, identities = _validate_high(family, levels["high"], reader)
     _, medium_identities = _validate_derived(
         family,
         "medium",
         levels["medium"],
         reader,
-        hard_package=hard_package,
-        expected_hint=hard_hint,
+        high_package=high_package,
+        expected_hint=high_hint,
         expected_hint_index=1,
         expected_parent_hint=None,
     )
     identities.extend(medium_identities)
-    if "guided" in levels:
-        guided_hint, guided_identities = _validate_derived(
+    if "low" in levels:
+        low_hint, low_identities = _validate_derived(
             family,
-            "guided",
-            levels["guided"],
+            "low",
+            levels["low"],
             reader,
-            hard_package=hard_package,
+            high_package=high_package,
             expected_hint=None,
             expected_hint_index=2,
-            expected_parent_hint=hard_hint,
+            expected_parent_hint=high_hint,
         )
-        if guided_hint == hard_hint:
-            raise FamilyValidationError("guided：必须绑定一个更晚且不同的 reviewed hint")
-        identities.extend(guided_identities)
+        if low_hint == high_hint:
+            raise FamilyValidationError("low：必须绑定一个更晚且不同的 reviewed hint")
+        identities.extend(low_identities)
     for offset, field in enumerate(("job_id", "trial_id", "sandbox_id", "session_id")):
         values = [identity[offset] for identity in identities]
         if len(values) != len(set(values)):
@@ -873,7 +873,18 @@ def _validate_standard(family: Path, manifest: dict[str, Any], question_id: str)
 
 def validate_family(question: int, family: Path, *, staging_required: bool = True) -> dict[str, Any]:
     """校验标准题族或 Q01/Q02 窄范围历史兼容题族。"""
-    expected_root = (WORKBENCH_ROOT / f"q{question:02d}").resolve() if staging_required else (QUESTION_ROOT / str(question) / "new-question").resolve()
+    numbered_root = QUESTION_ROOT / str(question)
+    legacy_publication = numbered_root / "new-question"
+    publication = (
+        legacy_publication
+        if question <= 2 and legacy_publication.is_dir()
+        else numbered_root / "question-pack"
+    )
+    expected_root = (
+        (WORKBENCH_ROOT / f"q{question:02d}").resolve()
+        if staging_required
+        else publication.resolve()
+    )
     try:
         family.resolve().relative_to(expected_root)
     except (OSError, ValueError) as error:

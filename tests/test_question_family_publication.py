@@ -195,7 +195,7 @@ def formal(evidence_root: Path, *, name: str, package: str, level: str, contract
         "provenance_pass": True,
         "scientific_contract_same_source": True,
     }
-    if level != "hard":
+    if level != "high":
         extra["derived_only_from_reviewed_hint"] = True
     return write_evidence(
         evidence_root,
@@ -240,7 +240,7 @@ def reviewed_hint(
         name=f"{name}-review",
         evidence_type="hint-review",
         package=package,
-        level="hard",
+        level="high",
         contract=contract,
         verdict="PASS",
         contains_answer=False,
@@ -253,7 +253,7 @@ def reviewed_hint(
         name=f"{name}-result",
         evidence_type="hint-result",
         package=package,
-        level="hard",
+        level="high",
         contract=contract,
         classification="SCIENTIFIC_RESULT",
         mode="hint",
@@ -299,8 +299,8 @@ def runtime_closure_evidence(
                 "question_revision": "r1",
                 "package_sha256": package,
                 "baseline_identity_sha256": artifact_identity_sha256(baseline),
-                "researcher_request_id": "request-hard-blind-1",
-                "sandbox_id": "sandbox-hard-blind-1",
+                "researcher_request_id": "request-high-blind-1",
+                "sandbox_id": "sandbox-high-blind-1",
                 "runtime_delta_request_ids": [],
             }
         )
@@ -390,10 +390,10 @@ def runtime_closure_evidence(
     )
     return write_evidence(
         evidence_root,
-        name="hard-runtime",
+        name="high-runtime",
         evidence_type="runtime-closure",
         package=package,
-        level="hard",
+        level="high",
         contract=contract,
         verdict="PASS",
         runtime_closure=sealed(closure),
@@ -410,26 +410,26 @@ def complete_family(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pa
     question_root = tmp_path / "questions"
     evidence_root = tmp_path / "evidence"
     for number in range(1, 33):
-        (question_root / str(number) / "new-question").mkdir(parents=True)
+        (question_root / str(number) / "question-pack").mkdir(parents=True)
     monkeypatch.setattr(qfv, "WORKBENCH_ROOT", workbench)
     monkeypatch.setattr(qfv, "QUESTION_ROOT", question_root)
     monkeypatch.setattr(qfv, "EVIDENCE_ROOT", evidence_root)
     monkeypatch.setattr(promoter, "QUESTION_ROOT", question_root)
     monkeypatch.setattr(checker, "QUESTION_ROOT", question_root)
     family = workbench / "q03" / "scientific-family"
-    hard_package = make_package(family / "hard", "hard")
+    high_package = make_package(family / "high", "high")
     medium_package = make_package(family / "medium", "medium")
-    contract = qfv.scientific_contract_sha256(family / "hard")
+    contract = qfv.scientific_contract_sha256(family / "high")
     assert qfv.scientific_contract_sha256(family / "medium") == contract
     hint_sha = "d" * 64
     hint = reviewed_hint(
         evidence_root,
-        name="hard-hint",
-        package=hard_package,
-        package_path=family / "hard",
+        name="high-hint",
+        package=high_package,
+        package_path=family / "high",
         contract=contract,
         hint_sha=hint_sha,
-        identity="hard-hint",
+        identity="high-hint",
         hint_index=1,
         parent_hint_sha256=None,
     )
@@ -437,10 +437,10 @@ def complete_family(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pa
     for index, score in enumerate((0.2, 0.4, 0.6), 1):
         evidence = write_evidence(
             evidence_root,
-            name=f"hard-blind-{index}",
+            name=f"high-blind-{index}",
             evidence_type="fresh-blind",
-            package=hard_package,
-            level="hard",
+            package=high_package,
+            level="high",
             contract=contract,
             classification="SCIENTIFIC_RESULT",
             mode="blind",
@@ -448,30 +448,30 @@ def complete_family(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pa
             score=score,
             **researcher_binding(
                 evidence_root,
-                package_path=family / "hard",
-                package=hard_package,
-                prefix=f"hard-blind-{index}",
+                package_path=family / "high",
+                package=high_package,
+                prefix=f"high-blind-{index}",
                 mode="blind",
                 attempt_index=index,
                 context_digests=[],
             ),
         )
         blinds.append({"score": score, "evidence": evidence})
-    hard = {
+    high = {
         "status": "PASS_FINAL_PROGRESSION",
-        "package_sha256": hard_package,
+        "package_sha256": high_package,
         "scientific_contract_sha256": contract,
-        "formal_reviewer": formal(evidence_root, name="hard-formal", package=hard_package, level="hard", contract=contract),
-        "oracle_validation": perfect(evidence_root, name="hard-oracle", kind="oracle", package=hard_package, level="hard", contract=contract),
-        "honest_validation": perfect(evidence_root, name="hard-honest", kind="honest", package=hard_package, level="hard", contract=contract),
+        "formal_reviewer": formal(evidence_root, name="high-formal", package=high_package, level="high", contract=contract),
+        "oracle_validation": perfect(evidence_root, name="high-oracle", kind="oracle", package=high_package, level="high", contract=contract),
+        "honest_validation": perfect(evidence_root, name="high-honest", kind="honest", package=high_package, level="high", contract=contract),
         "fresh_blinds": blinds,
         "successful_hint": hint,
         "runtime_closure": runtime_closure_evidence(
             evidence_root,
-            package=hard_package,
+            package=high_package,
             contract=contract,
         ),
-        "post_validation": write_evidence(evidence_root, name="hard-post", evidence_type="post-validation", package=hard_package, level="hard", contract=contract, verdict="PASS_FINAL_PROGRESSION", reviewer_independent=True),
+        "post_validation": write_evidence(evidence_root, name="high-post", evidence_type="post-validation", package=high_package, level="high", contract=contract, verdict="PASS_FINAL_PROGRESSION", reviewer_independent=True),
     }
     medium_result = write_evidence(
         evidence_root,
@@ -514,7 +514,7 @@ def complete_family(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pa
         "family_slug": "scientific-family",
         "scientific_objective": "Select a transferable scientific method for held-out conditions.",
         "scientific_contract_sha256": contract,
-        "levels": {"hard": hard, "medium": medium},
+        "levels": {"high": high, "medium": medium},
     }
     (family / "FAMILY_MANIFEST.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return family, manifest
@@ -556,7 +556,7 @@ def retarget_medium_package(family: Path, manifest: dict[str, object]) -> str:
     return package
 
 
-def test_complete_hard_medium_family_passes(complete_family: tuple[Path, dict[str, object]]) -> None:
+def test_complete_high_medium_family_passes(complete_family: tuple[Path, dict[str, object]]) -> None:
     family, _ = complete_family
     assert qfv.validate_family(3, family)["family_slug"] == "scientific-family"
 
@@ -580,7 +580,7 @@ def test_runtime_closure_rejects_schema_v1_environment_receipt(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    runtime_link = manifest["levels"]["hard"]["runtime_closure"]  # type: ignore[index]
+    runtime_link = manifest["levels"]["high"]["runtime_closure"]  # type: ignore[index]
     runtime = json.loads(Path(runtime_link["path"]).read_text())
     receipt_link = runtime["environment_receipt"]
     receipt = json.loads(Path(receipt_link["path"]).read_text())
@@ -597,7 +597,7 @@ def test_runtime_closure_rejects_manifest_lock_or_clean_sandbox_drift(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    runtime_link = manifest["levels"]["hard"]["runtime_closure"]  # type: ignore[index]
+    runtime_link = manifest["levels"]["high"]["runtime_closure"]  # type: ignore[index]
     runtime = json.loads(Path(runtime_link["path"]).read_text())
     lock_link = runtime["dependency_lock"]
     lock_path = Path(lock_link["path"])
@@ -613,7 +613,7 @@ def test_runtime_closure_requires_two_distinct_clean_sandboxes(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    runtime_link = manifest["levels"]["hard"]["runtime_closure"]  # type: ignore[index]
+    runtime_link = manifest["levels"]["high"]["runtime_closure"]  # type: ignore[index]
     runtime = json.loads(Path(runtime_link["path"]).read_text())
     clean_link = runtime["clean_sandbox_evidence"]
     clean = json.loads(Path(clean_link["path"]).read_text())
@@ -629,7 +629,7 @@ def test_runtime_closure_requires_manifest_immutable_image_digest(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    runtime_link = manifest["levels"]["hard"]["runtime_closure"]  # type: ignore[index]
+    runtime_link = manifest["levels"]["high"]["runtime_closure"]  # type: ignore[index]
     runtime = json.loads(Path(runtime_link["path"]).read_text())
     manifest_link = runtime["environment_manifest"]
     environment_manifest = json.loads(Path(manifest_link["path"]).read_text())
@@ -645,15 +645,15 @@ def test_runtime_closure_requires_manifest_immutable_image_digest(
         qfv.validate_family(3, family)
 
 
-def test_hard_blind_at_threshold_is_too_easy(complete_family: tuple[Path, dict[str, object]]) -> None:
+def test_high_blind_at_threshold_is_too_easy(complete_family: tuple[Path, dict[str, object]]) -> None:
     family, manifest = complete_family
-    manifest["levels"]["hard"]["fresh_blinds"][0]["score"] = 0.85  # type: ignore[index]
+    manifest["levels"]["high"]["fresh_blinds"][0]["score"] = 0.85  # type: ignore[index]
     rewrite_manifest(family, manifest)
     with pytest.raises(qfv.FamilyValidationError, match="TOO_EASY"):
         qfv.validate_family(3, family)
 
 
-def test_medium_contract_must_match_hard(complete_family: tuple[Path, dict[str, object]]) -> None:
+def test_medium_contract_must_match_high(complete_family: tuple[Path, dict[str, object]]) -> None:
     family, manifest = complete_family
     manifest["levels"]["medium"]["scientific_contract_sha256"] = "e" * 64  # type: ignore[index]
     rewrite_manifest(family, manifest)
@@ -661,9 +661,9 @@ def test_medium_contract_must_match_hard(complete_family: tuple[Path, dict[str, 
         qfv.validate_family(3, family)
 
 
-def test_medium_must_derive_from_hard_hint(complete_family: tuple[Path, dict[str, object]]) -> None:
+def test_medium_must_derive_from_high_hint(complete_family: tuple[Path, dict[str, object]]) -> None:
     family, manifest = complete_family
-    manifest["levels"]["medium"]["derivation_hint"]["review_seal"] = manifest["levels"]["hard"]["formal_reviewer"]  # type: ignore[index]
+    manifest["levels"]["medium"]["derivation_hint"]["review_seal"] = manifest["levels"]["high"]["formal_reviewer"]  # type: ignore[index]
     rewrite_manifest(family, manifest)
     with pytest.raises(qfv.FamilyValidationError, match="evidence 身份不匹配"):
         qfv.validate_family(3, family)
@@ -682,29 +682,29 @@ def test_medium_fresh_harbor_must_pass(complete_family: tuple[Path, dict[str, ob
         qfv.validate_family(3, family)
 
 
-def test_optional_guided_level_passes(complete_family: tuple[Path, dict[str, object]]) -> None:
+def test_optional_low_level_passes(complete_family: tuple[Path, dict[str, object]]) -> None:
     family, manifest = complete_family
     contract = manifest["scientific_contract_sha256"]
-    hard_package = manifest["levels"]["hard"]["package_sha256"]  # type: ignore[index]
-    evidence_root = Path(manifest["levels"]["hard"]["formal_reviewer"]["path"]).parent  # type: ignore[index]
-    guided_package = make_package(family / "guided", "guided")
-    guided_hint = reviewed_hint(
+    high_package = manifest["levels"]["high"]["package_sha256"]  # type: ignore[index]
+    evidence_root = Path(manifest["levels"]["high"]["formal_reviewer"]["path"]).parent  # type: ignore[index]
+    low_package = make_package(family / "low", "low")
+    low_hint = reviewed_hint(
         evidence_root,
-        name="guided-hint",
-        package=hard_package,
-        package_path=family / "hard",
+        name="low-hint",
+        package=high_package,
+        package_path=family / "high",
         contract=contract,
         hint_sha="f" * 64,
-        identity="guided-hint",
+        identity="low-hint",
         hint_index=2,
         parent_hint_sha256="d" * 64,
     )
-    guided_harbor = write_evidence(
+    low_harbor = write_evidence(
         evidence_root,
-        name="guided-harbor",
+        name="low-harbor",
         evidence_type="hint-result",
-        package=guided_package,
-        level="guided",
+        package=low_package,
+        level="low",
         contract=contract,
         classification="SCIENTIFIC_RESULT",
         mode="hint",
@@ -715,31 +715,31 @@ def test_optional_guided_level_passes(complete_family: tuple[Path, dict[str, obj
         parent_hint_sha256="d" * 64,
         **researcher_binding(
             evidence_root,
-            package_path=family / "guided",
-            package=guided_package,
-            prefix="guided-harbor",
+            package_path=family / "low",
+            package=low_package,
+            prefix="low-harbor",
             mode="hint",
             attempt_index=2,
             context_digests=["f" * 64],
         ),
     )
-    manifest["levels"]["guided"] = {  # type: ignore[index]
+    manifest["levels"]["low"] = {  # type: ignore[index]
         "status": "PASS_FINAL_PROGRESSION",
-        "package_sha256": guided_package,
+        "package_sha256": low_package,
         "scientific_contract_sha256": contract,
-        "derivation_hint": guided_hint,
-        "formal_reviewer": formal(evidence_root, name="guided-formal", package=guided_package, level="guided", contract=contract),
-        "oracle_validation": perfect(evidence_root, name="guided-oracle", kind="oracle", package=guided_package, level="guided", contract=contract),
-        "honest_validation": perfect(evidence_root, name="guided-honest", kind="honest", package=guided_package, level="guided", contract=contract),
-        "fresh_harbor": [guided_harbor],
+        "derivation_hint": low_hint,
+        "formal_reviewer": formal(evidence_root, name="low-formal", package=low_package, level="low", contract=contract),
+        "oracle_validation": perfect(evidence_root, name="low-oracle", kind="oracle", package=low_package, level="low", contract=contract),
+        "honest_validation": perfect(evidence_root, name="low-honest", kind="honest", package=low_package, level="low", contract=contract),
+        "fresh_harbor": [low_harbor],
     }
     rewrite_manifest(family, manifest)
-    assert set(qfv.validate_family(3, family)["levels"]) == {"hard", "medium", "guided"}
+    assert set(qfv.validate_family(3, family)["levels"]) == {"high", "medium", "low"}
 
 
 def test_noncanonical_evidence_is_rejected(complete_family: tuple[Path, dict[str, object]]) -> None:
     family, manifest = complete_family
-    link = manifest["levels"]["hard"]["formal_reviewer"]  # type: ignore[index]
+    link = manifest["levels"]["high"]["formal_reviewer"]  # type: ignore[index]
     path = Path(link["path"])
     value = json.loads(path.read_text())
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
@@ -765,7 +765,7 @@ def test_promoter_applies_atomic_family_and_checker_reads_same_contract(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     family, manifest = complete_family
-    publication_root = qfv.QUESTION_ROOT / "3" / "new-question"
+    publication_root = qfv.QUESTION_ROOT / "3" / "question-pack"
     monkeypatch.setattr(promoter, "PROMOTION_EVIDENCE_ROOT", tmp_path / "promotions")
     monkeypatch.setattr(
         promoter,
@@ -798,7 +798,7 @@ def test_promoter_post_copy_validation_failure_never_exposes_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     family, manifest = complete_family
-    publication_root = qfv.QUESTION_ROOT / "3" / "new-question"
+    publication_root = qfv.QUESTION_ROOT / "3" / "question-pack"
     target = publication_root / manifest["family_slug"]
     original_validate = promoter.validate_family
 
@@ -832,7 +832,7 @@ def test_promoter_detects_source_mutation_during_copy_without_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     family, manifest = complete_family
-    publication_root = qfv.QUESTION_ROOT / "3" / "new-question"
+    publication_root = qfv.QUESTION_ROOT / "3" / "question-pack"
     target = publication_root / manifest["family_slug"]
     original_copy_family = promoter.copy_family
 
@@ -879,15 +879,15 @@ def test_promotion_lock_serializes_processes(tmp_path: Path) -> None:
     assert second.exitcode == 0
 
 
-def test_schema_declares_hard_medium_and_optional_guided() -> None:
+def test_schema_declares_high_medium_and_optional_low() -> None:
     schema = json.loads((Path(__file__).parents[1] / "policies/publishing/FAMILY_MANIFEST.schema.json").read_text())
     standard = schema["$defs"]["standardFamily"]
     levels = standard["properties"]["levels"]
     assert standard["properties"]["publication_mode"]["const"] == "family-v1"
-    assert levels["required"] == ["hard", "medium"]
-    assert set(levels["properties"]) == {"hard", "medium", "guided"}
+    assert levels["required"] == ["high", "medium"]
+    assert set(levels["properties"]) == {"high", "medium", "low"}
     assert "re-hashing" in schema["$defs"]["scientificContractSha256"]["description"]
-    assert "schema-v2 EnvironmentReceipt" in schema["$defs"]["hardLevel"]["properties"]["runtime_closure"]["description"]
+    assert "schema-v2 EnvironmentReceipt" in schema["$defs"]["highLevel"]["properties"]["runtime_closure"]["description"]
 
 
 def make_grandfathered_family(
@@ -1060,7 +1060,7 @@ def test_checker_reports_missing_roots_and_invalid_entries(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     question_root = tmp_path / "questions"
-    publication = question_root / "1" / "new-question"
+    publication = question_root / "1" / "question-pack"
     (publication / "invalid-a").mkdir(parents=True)
     (publication / "invalid-b").mkdir()
     monkeypatch.setattr(qfv, "QUESTION_ROOT", question_root)
@@ -1070,7 +1070,7 @@ def test_checker_reports_missing_roots_and_invalid_entries(
     report = json.loads(capsys.readouterr().out)
     assert report["families"] == 0
     assert any("应有恰好一个" in failure for failure in report["failures"])
-    assert any("缺少 new-question" in failure for failure in report["failures"])
+    assert any("缺少 question-pack" in failure for failure in report["failures"])
     assert any("invalid-a" in failure for failure in report["failures"])
 
 
@@ -1079,7 +1079,7 @@ def test_promoter_refuses_nonempty_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     family, _ = complete_family
-    publication = qfv.QUESTION_ROOT / "3" / "new-question"
+    publication = qfv.QUESTION_ROOT / "3" / "question-pack"
     (publication / "occupied").mkdir()
     monkeypatch.setattr(
         promoter,
@@ -1123,8 +1123,8 @@ def test_standard_family_rejects_duplicate_execution_identity(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    first = manifest["levels"]["hard"]["fresh_blinds"][0]["evidence"]  # type: ignore[index]
-    second = manifest["levels"]["hard"]["fresh_blinds"][1]["evidence"]  # type: ignore[index]
+    first = manifest["levels"]["high"]["fresh_blinds"][0]["evidence"]  # type: ignore[index]
+    second = manifest["levels"]["high"]["fresh_blinds"][1]["evidence"]  # type: ignore[index]
     first_data = json.loads(Path(first["path"]).read_text())
     second_path = Path(second["path"])
     second_data = json.loads(second_path.read_text())
@@ -1141,8 +1141,8 @@ def test_standard_family_rejects_reuse_of_one_execution_identity_field(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    first = manifest["levels"]["hard"]["fresh_blinds"][0]["evidence"]  # type: ignore[index]
-    second = manifest["levels"]["hard"]["fresh_blinds"][1]["evidence"]  # type: ignore[index]
+    first = manifest["levels"]["high"]["fresh_blinds"][0]["evidence"]  # type: ignore[index]
+    second = manifest["levels"]["high"]["fresh_blinds"][1]["evidence"]  # type: ignore[index]
     first_data = json.loads(Path(first["path"]).read_text())
     second_data = json.loads(Path(second["path"]).read_text())
     second_data["job_id"] = first_data["job_id"]
@@ -1157,7 +1157,7 @@ def test_blind_requires_empty_context_and_consumed_bound_capability(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    link = manifest["levels"]["hard"]["fresh_blinds"][0]["evidence"]  # type: ignore[index]
+    link = manifest["levels"]["high"]["fresh_blinds"][0]["evidence"]  # type: ignore[index]
     value = json.loads(Path(link["path"]).read_text())
     value["context_digests"] = ["a" * 64]
     rewrite_link(link, value)
@@ -1170,7 +1170,7 @@ def test_blind_rejects_capability_bound_to_other_request(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    link = manifest["levels"]["hard"]["fresh_blinds"][0]["evidence"]  # type: ignore[index]
+    link = manifest["levels"]["high"]["fresh_blinds"][0]["evidence"]  # type: ignore[index]
     value = json.loads(Path(link["path"]).read_text())
     capability_link = value["capability"]
     capability = json.loads(Path(capability_link["path"]).read_text())
@@ -1195,13 +1195,13 @@ def test_derived_result_uses_workflow_hint_mode_and_order(
         qfv.validate_family(3, family)
 
 
-def test_guided_hint_must_be_second_and_parent_hard_hint(
+def test_low_hint_must_be_second_and_parent_high_hint(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    test_optional_guided_level_passes((family, manifest))
+    test_optional_low_level_passes((family, manifest))
     manifest = json.loads((family / "FAMILY_MANIFEST.json").read_text())
-    link = manifest["levels"]["guided"]["derivation_hint"]["review_seal"]
+    link = manifest["levels"]["low"]["derivation_hint"]["review_seal"]
     review = json.loads(Path(link["path"]).read_text())
     review["parent_hint_sha256"] = None
     rewrite_link(link, review)
@@ -1214,7 +1214,7 @@ def test_standard_family_rejects_bool_score(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    manifest["levels"]["hard"]["fresh_blinds"][0]["score"] = True  # type: ignore[index]
+    manifest["levels"]["high"]["fresh_blinds"][0]["score"] = True  # type: ignore[index]
     rewrite_manifest(family, manifest)
     with pytest.raises(qfv.FamilyValidationError, match="分数必须是数值"):
         qfv.validate_family(3, family)
@@ -1224,7 +1224,7 @@ def test_evidence_hash_mismatch_is_rejected(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    manifest["levels"]["hard"]["formal_reviewer"]["sha256"] = "0" * 64  # type: ignore[index]
+    manifest["levels"]["high"]["formal_reviewer"]["sha256"] = "0" * 64  # type: ignore[index]
     rewrite_manifest(family, manifest)
     with pytest.raises(qfv.FamilyValidationError, match="evidence 字节不匹配"):
         qfv.validate_family(3, family)
@@ -1264,7 +1264,7 @@ def test_publication_tree_rejects_symlink(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, _ = complete_family
-    (family / "linked").symlink_to(family / "hard", target_is_directory=True)
+    (family / "linked").symlink_to(family / "high", target_is_directory=True)
     with pytest.raises(qfv.FamilyValidationError, match="软链接或特殊节点"):
         qfv.validate_family(3, family)
 
@@ -1297,7 +1297,7 @@ def test_evidence_must_stay_inside_authority_root(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    link = manifest["levels"]["hard"]["formal_reviewer"]  # type: ignore[index]
+    link = manifest["levels"]["high"]["formal_reviewer"]  # type: ignore[index]
     link["path"] = "/tmp/outside-authority.json"
     rewrite_manifest(family, manifest)
     with pytest.raises(qfv.FamilyValidationError, match="evidence 必须位于"):
@@ -1308,7 +1308,7 @@ def test_harbor_execution_identity_must_be_complete(
     complete_family: tuple[Path, dict[str, object]],
 ) -> None:
     family, manifest = complete_family
-    link = manifest["levels"]["hard"]["fresh_blinds"][0]["evidence"]  # type: ignore[index]
+    link = manifest["levels"]["high"]["fresh_blinds"][0]["evidence"]  # type: ignore[index]
     path = Path(link["path"])
     evidence = json.loads(path.read_text())
     evidence["session_id"] = ""

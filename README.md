@@ -21,7 +21,7 @@ Harbor 运行目录。
 6. 首次有效解题后，Teacher 只依据公开验证结果调整真实科学难度，Labwright 根据真实 delta 精简并
    固化题目镜像，不按作者侧依赖猜测镜像内容。
 7. 完整 Reviewer 验证 Oracle、诚实解、对抗样例、最终环境和无泄漏证据。
-8. 每个 hard revision 执行三轮独立、空策略上下文的 fresh blind；任一得分
+8. 每个 `high` revision 执行三轮独立、空策略上下文的 fresh blind；任一得分
    `>=0.85` 即 `TOO_EASY`，修订难度后从 blind-a01 重启。三轮均低于通过线后，
    才能运行一至两级经审核的非答案提示；提示后必须达到通过线。Agent 硬超时为
    3600 秒；达到超时后暂存该题并调度下一题。
@@ -91,11 +91,11 @@ Labwright 有两条生命周期，运行时增量必须先于稳定镜像：
 必须同步到：
 
 ```text
-/personal/codex-workspace/question-from-questions/<题号>/new-question/<题族>/
+/personal/codex-workspace/question-from-questions/<题号>/question-pack/<题族>/
   FAMILY_MANIFEST.json
-  hard/
+  high/
   medium/
-  guided/  # 可选
+  low/  # 可选
 ```
 
 ## 开发检查

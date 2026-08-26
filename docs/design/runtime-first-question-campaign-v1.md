@@ -25,7 +25,7 @@ Q1 与 Q2 是 owner 明确确认的 grandfathered 完成题。本次改造不重
    可以在绕过该判断时写入完成标记。
 3. 旧 scheduler 默认五个活动 Teacher，没有 writer lease 或 heartbeat，且把可能
    永久不变化的 run 状态当成存活信号。
-4. 旧发布政策要求 `hard-plus` 增加科学约束，而破壁协议实际是用经审核的提示从
+4. 旧发布政策要求 `high-plus` 增加科学约束，而破壁协议实际是用经审核的提示从
    同一高难题派生更易版本。
 
 ## 目标流程
@@ -39,7 +39,7 @@ Q1 与 Q2 是 owner 明确确认的 grandfathered 完成题。本次改造不重
        平台/环境失败 -> trace-backed runtime delta -> 重试同一科学 attempt
        三次均 < 0.85 -> 经审核的提示递进
   -> 带提示 fresh 解题 >= 0.85
-  -> 物化 hard/medium/(guided)，保持同一科学合同
+  -> 物化 high/medium/(low)，保持同一科学合同
   -> trace-backed Stable 环境 + 正式复审 + 独立最终复审
   -> 原子发布
 ```
@@ -52,9 +52,9 @@ heartbeat、当前 run 和发布结果。scheduler 只公开认领、心跳、�
 
 - Scheduler snapshot 从 schema v1 升级到 v2；首次写 v2 前保留 v1 原始字节备份。
 - 默认且 campaign 固定的 Teacher writer lease 上限为 3。
-- 发布级别为 `hard`、`medium` 和可选 `guided`。
+- 发布级别为 `high`、`medium` 和可选 `low`。
 - 高难版闭环是三次 blind 均 `<0.85`，随后至少一次 reviewed hint fresh 解题
-  `>=0.85`。`medium/guided` 从成功提示派生，并与 `hard` 共享科学合同。
+  `>=0.85`。`medium/low` 从成功提示派生，并与 `high` 共享科学合同。
 - Q1/Q2 以 grandfathered completion 进入总看板，不经过 Q3–Q32 的新晋级合同。
 
 ## 事务、并发与安全模型
@@ -89,7 +89,7 @@ heartbeat、当前 run 和发布结果。scheduler 只公开认领、心跳、�
 
 1. **政策切片**：统一 breaker、环境、发布和 agent 指引，不改生产代码。
 2. **Campaign/scheduler 切片**：实现 lease、heartbeat、三槽、v1 迁移和确定性看板。
-3. **发布切片**：统一 schema/checker/promoter 为 hard/medium/guided 和单一高难证据链。
+3. **发布切片**：统一 schema/checker/promoter 为 high/medium/low 和单一高难证据链。
 4. **Validation/workflow 切片**：关闭任何绕过 `decide_validation()`、完整健康门或
    post-validation 就能写 `COMPLETED` 的路径。
 5. **运行切片**：初始化 Q1/Q2 grandfather，Q3–Q32 排队，并恢复三个隔离 writer lease。
