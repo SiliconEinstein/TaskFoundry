@@ -35,6 +35,7 @@ class RunState(StrEnum):
     BLIND_VALIDATION = "BLIND_VALIDATION"
     HINT_VALIDATION = "HINT_VALIDATION"
     VALIDATION_PASSED = "VALIDATION_PASSED"
+    RUNTIME_FINALIZATION = "RUNTIME_FINALIZATION"
     TOO_EASY = "TOO_EASY"
     DEFERRED_TIMEOUT = "DEFERRED_TIMEOUT"
     HUMAN_REVIEW = "HUMAN_REVIEW"
@@ -61,6 +62,45 @@ class SourceQuestion:
 
 
 @dataclass(frozen=True)
+class BackgroundEvidence:
+    """题面背景中的一条证据及其对方法决策的作用。"""
+
+    evidence_id: str
+    statement: str
+    role: str
+    applicable_conditions: str
+    decision_effect: str
+    linked_methods: tuple[str, ...] = ()
+    public_clues: tuple[str, ...] = ()
+
+    def validate(self) -> None:
+        """拒绝无法审计的背景条目和伪装成难度的空噪声。"""
+        for name in (
+            "evidence_id",
+            "statement",
+            "role",
+            "applicable_conditions",
+            "decision_effect",
+        ):
+            if not getattr(self, name).strip():
+                raise ContractError(f"background evidence {name} must be non-empty")
+        if self.role not in {
+            "load_bearing",
+            "context_only",
+            "conditional_distractor",
+        }:
+            raise ContractError("unsupported background evidence role")
+        if any(not value.strip() for value in (*self.linked_methods, *self.public_clues)):
+            raise ContractError("background evidence lists must contain non-empty values")
+        if self.role == "conditional_distractor" and (
+            not self.linked_methods or not self.public_clues
+        ):
+            raise ContractError(
+                "conditional distractor requires linked methods and public clues"
+            )
+
+
+@dataclass(frozen=True)
 class QuestionDesignBrief:
     """与具体题包和执行框架解耦的题目设计大纲。"""
 
@@ -78,6 +118,9 @@ class QuestionDesignBrief:
     environment_capabilities: tuple[str, ...]
     difficulty_hypothesis: str
     solvability_argument: str
+    background_evidence: tuple[BackgroundEvidence, ...] = ()
+    difficulty_progression: dict[str, str] = field(default_factory=dict)
+    ground_truth_plan: dict[str, str] = field(default_factory=dict)
     non_goals: tuple[str, ...] = ()
     target_solution_time_sec: int = 1800
     schema_version: int = 1
@@ -103,6 +146,11 @@ class QuestionDesignBrief:
             raise ContractError("method_space must be non-empty")
         for item in self.source_questions:
             item.validate()
+        for item in self.background_evidence:
+            item.validate()
+        evidence_ids = [item.evidence_id for item in self.background_evidence]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ContractError("background evidence identifiers must be unique")
         for name in (
             "public_inputs",
             "required_outputs",
@@ -111,6 +159,22 @@ class QuestionDesignBrief:
         ):
             if not getattr(self, name):
                 raise ContractError(f"{name} must be non-empty")
+        if self.difficulty_progression:
+            expected_levels = {"high", "medium", "low"}
+            if set(self.difficulty_progression) != expected_levels or any(
+                not value.strip() for value in self.difficulty_progression.values()
+            ):
+                raise ContractError(
+                    "difficulty_progression must define non-empty high, medium, and low levels"
+                )
+        if self.ground_truth_plan:
+            expected_fields = {"primary", "cross_check", "reference_type", "tolerance_basis"}
+            if set(self.ground_truth_plan) != expected_fields or any(
+                not value.strip() for value in self.ground_truth_plan.values()
+            ):
+                raise ContractError(
+                    "ground_truth_plan must define primary, cross_check, reference_type, and tolerance_basis"
+                )
         if not 1 <= self.target_solution_time_sec <= 1800:
             raise ContractError("target_solution_time_sec must be within 1800 seconds")
 
@@ -124,6 +188,18 @@ class QuestionDesignBrief:
         """解析并校验 JSON 形式的设计大纲。"""
         converted = dict(value)
         converted["source_questions"] = tuple(SourceQuestion(**item) for item in value["source_questions"])
+        converted["background_evidence"] = tuple(
+            BackgroundEvidence(
+                **(
+                    item
+                    | {
+                        "linked_methods": tuple(item.get("linked_methods", ())),
+                        "public_clues": tuple(item.get("public_clues", ())),
+                    }
+                )
+            )
+            for item in value.get("background_evidence", ())
+        )
         for name in (
             "method_space",
             "public_inputs",

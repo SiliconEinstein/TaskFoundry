@@ -1,5 +1,5 @@
 """TaskFoundry 公开包。"""
 
-from .model import Actor, QuestionDesignBrief, RunState
+from .model import Actor, BackgroundEvidence, QuestionDesignBrief, RunState
 
-__all__ = ["Actor", "QuestionDesignBrief", "RunState"]
+__all__ = ["Actor", "BackgroundEvidence", "QuestionDesignBrief", "RunState"]

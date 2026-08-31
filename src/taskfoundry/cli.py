@@ -4,32 +4,48 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any, Sequence
 
 from .codex_agent import CodexDispatcher
-from .harbor import HarborJobSpec, build_job_config, runtime_from_dict, write_job_config
+from .harbor import (
+    HarborJobSpec,
+    PersistentValidationSpec,
+    build_job_config,
+    runtime_from_dict,
+    write_job_config,
+)
 from .harbor_queue import HarborJobQueue, HarborQueueState
-from .health import BoundHealthEvidence, EvidenceReference, HealthGate
-from .labwright import ArtifactIdentity, EnvironmentReceipt, FileLabwrightRegistry, RuntimeSnapshot
+from .labwright import (
+    ArtifactIdentity,
+    EnvironmentReceipt,
+    FileLabwrightRegistry,
+    RuntimeSnapshot,
+)
 from .labwright_runtime import FileLabwrightRuntimeService
-from .model import Actor, RunState
-from .package import lint_package, migrate_legacy_task
+from .model import Actor
+from .package import lint_package
 from .policy import file_sha256
 from .researcher import (
     CapabilityStore,
     IssuedHandoff,
-    ResearcherRequest,
     execute_harbor,
     write_json,
 )
 from .scheduler import QuestionScheduler
 from .scheduler_worker import SchedulerWorker
-from .skillbank import resolve_teacher_activation, validate_latest_brief
+from .skillbank import (
+    evaluate_skill_candidate,
+    reconcile_skill_batch,
+    record_skill_attribution,
+    resolve_teacher_activation,
+    validate_latest_brief,
+)
 from .store import RunStore
-from .validation import HealthEvidence
+from .validation_control import TeacherDecision
 from .workflow import RunWorkflow
 
 
@@ -41,59 +57,95 @@ def parser() -> argparse.ArgumentParser:
     lint = commands.add_parser("lint-package")
     lint.add_argument("package", type=Path)
 
-    migrate = commands.add_parser("migrate-task")
-    migrate.add_argument("source", type=Path)
-    migrate.add_argument("target", type=Path)
-    migrate.add_argument("--manifest", type=Path, required=True)
-
     status = commands.add_parser("status")
     status.add_argument("run_dir", type=Path)
 
     authoring = commands.add_parser("begin-authoring")
     authoring.add_argument("run_dir", type=Path)
 
-    design_evidence = commands.add_parser("attach-design-evidence")
-    design_evidence.add_argument("run_dir", type=Path)
-    design_evidence.add_argument("source_role_map", type=Path)
-    design_evidence.add_argument("ground_truth_ledger", type=Path)
+    bind_skill = commands.add_parser("bind-teacher-skill")
+    bind_skill.add_argument("run_dir", type=Path)
+    bind_skill.add_argument("question", type=int, choices=range(3, 33))
+    bind_skill.add_argument("stage", choices=["outline", "author"])
+    bind_skill.add_argument("activation", type=Path)
+
+    attach_brief = commands.add_parser("attach-question-brief")
+    attach_brief.add_argument("run_dir", type=Path)
+    attach_brief.add_argument("brief", type=Path)
 
     resolve_skill = commands.add_parser("resolve-teacher-skill")
     resolve_skill.add_argument("question", type=int, choices=range(3, 33))
     resolve_skill.add_argument("stage", choices=["outline", "author"])
     resolve_skill.add_argument("attempt_id")
+    resolve_skill.add_argument("--batch-id", required=True)
+    resolve_skill.add_argument(
+        "--batch-question",
+        type=int,
+        choices=range(3, 33),
+        action="append",
+        required=True,
+    )
+    resolve_skill.add_argument("--task-input", type=Path, action="append", default=[])
 
     validate_brief = commands.add_parser("validate-question-brief")
     validate_brief.add_argument("question", type=int, choices=range(3, 33))
 
-    freeze = commands.add_parser("freeze-package")
-    freeze.add_argument("run_dir", type=Path)
-    freeze.add_argument("package", type=Path)
+    attribution = commands.add_parser("record-skill-attribution")
+    attribution.add_argument("question", type=int, choices=range(3, 33))
+    attribution.add_argument("evidence", type=Path)
 
-    health = commands.add_parser("accept-health")
-    health.add_argument("run_dir", type=Path)
-    health.add_argument("health", type=Path)
-    health.add_argument("--evidence-ref", action="append", required=True)
+    reconcile = commands.add_parser("reconcile-skill-bank")
+    reconcile.add_argument("batch_id")
+    reconcile.add_argument(
+        "--question", type=int, choices=range(3, 33), action="append", required=True
+    )
 
-    bound_health = commands.add_parser("accept-bound-health")
-    bound_health.add_argument("run_dir", type=Path)
-    bound_health.add_argument("bundle", type=Path)
+    evaluate = commands.add_parser("evaluate-skill-candidate")
+    evaluate.add_argument("plan", type=Path)
+    evaluate.add_argument("verdict", type=Path)
 
-    blind = commands.add_parser("start-blind")
-    blind.add_argument("run_dir", type=Path)
+    direct = commands.add_parser("freeze-and-start-validation")
+    direct.add_argument("run_dir", type=Path)
+    direct.add_argument("package", type=Path)
+    direct.add_argument("--validation-session-id", required=True)
+    direct.add_argument("--researcher-thread-id", required=True)
 
-    audit = commands.add_parser("audit-researcher")
-    audit.add_argument("run_dir", type=Path)
-    audit.add_argument("request", type=Path)
-    audit.add_argument("capability", type=Path)
-    audit.add_argument("receipt", type=Path)
-    audit.add_argument("leakage_evidence", type=Path)
-    audit.add_argument("--hint-review", type=Path)
-    audit.add_argument("--revision-correction", type=Path)
+    record_round = commands.add_parser("record-validation-round")
+    record_round.add_argument("run_dir", type=Path)
+    record_round.add_argument("request_id")
+
+    decide_round = commands.add_parser("decide-persistent-validation-round")
+    decide_round.add_argument("run_dir", type=Path)
+    decide_round.add_argument("request_id")
+    decide_round.add_argument("round_index", type=int)
+    decide_round.add_argument(
+        "action",
+        choices=[
+            "CONTINUE_BLIND",
+            "CONTINUE_HINT",
+            "STOP_TOO_EASY",
+            "STOP_PASSED",
+            "STOP_BLOCKED",
+        ],
+    )
+    decide_round.add_argument("--hint")
+    decide_round.add_argument("--teacher-declares-non-answer", action="store_true")
+
+    record_session = commands.add_parser("record-persistent-validation-session")
+    record_session.add_argument("run_dir", type=Path)
+    record_session.add_argument("request_id")
+
+    repair_history = commands.add_parser("repair-validation-history-delivery")
+    repair_history.add_argument("run_dir", type=Path)
 
     revision = commands.add_parser("begin-difficulty-revision")
     revision.add_argument("run_dir", type=Path)
     revision.add_argument("revision")
     revision.add_argument("reason_evidence", type=Path)
+
+    migration = commands.add_parser("migrate-incomplete-validation")
+    migration.add_argument("run_dir", type=Path)
+    migration.add_argument("revision")
 
     accept_delta = commands.add_parser("accept-runtime-delta")
     accept_delta.add_argument("run_dir", type=Path)
@@ -103,13 +155,12 @@ def parser() -> argparse.ArgumentParser:
     accept_closure.add_argument("run_dir", type=Path)
     accept_closure.add_argument("closure", type=Path)
 
+    runtime_finalization = commands.add_parser("begin-runtime-finalization")
+    runtime_finalization.add_argument("run_dir", type=Path)
+
     bind_environment = commands.add_parser("bind-runtime-environment")
     bind_environment.add_argument("run_dir", type=Path)
     bind_environment.add_argument("receipt", type=Path)
-
-    post_validation = commands.add_parser("accept-post-validation")
-    post_validation.add_argument("run_dir", type=Path)
-    post_validation.add_argument("evidence", type=Path)
 
     environment = commands.add_parser("import-environment")
     environment.add_argument("state_root", type=Path)
@@ -126,11 +177,19 @@ def parser() -> argparse.ArgumentParser:
     harbor.add_argument("output", type=Path)
 
     issue = commands.add_parser("issue-researcher")
-    issue.add_argument("request", type=Path)
-    issue.add_argument("handoff_root", type=Path)
+    issue.add_argument("run_dir", type=Path)
+    issue.add_argument("request_id")
+    issue.add_argument("job_config", type=Path)
+    issue.add_argument("--approved-hint", type=Path)
+
+    revoke = commands.add_parser("revoke-researcher")
+    revoke.add_argument("handoff", type=Path)
+    revoke.add_argument("--reason", required=True)
 
     dispatch = commands.add_parser("dispatch")
-    dispatch.add_argument("--role", choices=["teacher", "researcher", "reviewer"], required=True)
+    dispatch.add_argument(
+        "--role", choices=["teacher", "researcher", "reviewer"], required=True
+    )
     dispatch.add_argument("--thread-id", required=True)
     dispatch.add_argument("--prompt", type=Path, required=True)
 
@@ -231,7 +290,6 @@ def _add_scheduler_parsers(commands: Any) -> None:
     publish = commands.add_parser("scheduler-bind-published-family")
     publish.add_argument("scheduler_root", type=Path)
     publish.add_argument("question_id")
-    publish.add_argument("family", type=Path)
     publish.add_argument("--owner-id", required=True)
     publish.add_argument("--lease-id", required=True)
     publish.add_argument("--generation", type=int, required=True)
@@ -248,25 +306,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     handlers = {
         "lint-package": _lint,
-        "migrate-task": _migrate,
         "status": _status,
         "begin-authoring": _begin_authoring,
-        "attach-design-evidence": _attach_design_evidence,
+        "bind-teacher-skill": _bind_teacher_skill,
+        "attach-question-brief": _attach_question_brief,
         "resolve-teacher-skill": _resolve_teacher_skill,
         "validate-question-brief": _validate_question_brief,
-        "freeze-package": _freeze_package,
-        "accept-health": _accept_health,
-        "accept-bound-health": _accept_bound_health,
-        "start-blind": _start_blind,
-        "audit-researcher": _audit_researcher,
+        "record-skill-attribution": _record_skill_attribution,
+        "reconcile-skill-bank": _reconcile_skill_bank,
+        "evaluate-skill-candidate": _evaluate_skill_candidate,
+        "freeze-and-start-validation": _freeze_and_start_validation,
+        "record-validation-round": _record_validation_round,
+        "decide-persistent-validation-round": _decide_persistent_validation_round,
+        "record-persistent-validation-session": _record_persistent_validation_session,
+        "repair-validation-history-delivery": _repair_validation_history_delivery,
         "begin-difficulty-revision": _begin_difficulty_revision,
+        "migrate-incomplete-validation": _migrate_incomplete_validation,
         "accept-runtime-delta": _accept_runtime_delta,
         "accept-runtime-closure": _accept_runtime_closure,
+        "begin-runtime-finalization": _begin_runtime_finalization,
         "bind-runtime-environment": _bind_runtime_environment,
-        "accept-post-validation": _accept_post_validation,
         "import-environment": _import_environment,
         "build-harbor-config": _build_harbor,
         "issue-researcher": _issue_researcher,
+        "revoke-researcher": _revoke_researcher,
         "dispatch": _dispatch,
         "researcher-run": _researcher_run,
         "harbor-queue-status": _harbor_queue_status,
@@ -299,10 +362,6 @@ def _lint(args: argparse.Namespace) -> dict[str, Any]:
     return report.to_dict()
 
 
-def _migrate(args: argparse.Namespace) -> dict[str, Any]:
-    return migrate_legacy_task(args.source, args.target, args.manifest).to_dict()
-
-
 def _status(args: argparse.Namespace) -> dict[str, Any]:
     store = RunStore(args.run_dir)
     snapshot = store.read_snapshot()
@@ -312,7 +371,7 @@ def _status(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _begin_authoring(args: argparse.Namespace) -> dict[str, Any]:
-    """从规范锁定或旧环境前置状态进入 Teacher 出题阶段。"""
+    """从已绑定 outline、Brief 与 author Skill 的状态进入出题。"""
     snapshot = RunWorkflow(RunStore(args.run_dir)).begin_authoring(
         Actor.TEACHER,
         "authoring:runtime-labwright",
@@ -320,42 +379,62 @@ def _begin_authoring(args: argparse.Namespace) -> dict[str, Any]:
     return snapshot.to_dict()
 
 
-def _freeze_package(args: argparse.Namespace) -> dict[str, Any]:
-    """按当前题目修订和题包摘要幂等冻结可供 Harbor 解题的题包。"""
-    store = RunStore(args.run_dir)
-    current = store.read_snapshot()
-    if current is None:
-        raise SystemExit("run is not initialized")
-    package_digest = lint_package(args.package).sha256
-    if current.state is RunState.PACKAGE_FROZEN and current.package_digest == package_digest:
-        return current.to_dict()
-    snapshot = RunWorkflow(store).freeze_package(
+def _bind_teacher_skill(args: argparse.Namespace) -> dict[str, Any]:
+    """把 SkillFoundry resolve 产物绑定到正式 run。"""
+    snapshot = RunWorkflow(RunStore(args.run_dir)).accept_teacher_skill_activation(
         Actor.TEACHER,
-        args.package,
-        f"package:freeze:{current.question_revision}:{package_digest}",
+        question=args.question,
+        stage=args.stage,
+        activation_path=args.activation,
+        idempotency_key=f"teacher-skill:{args.question}:{args.stage}:{file_sha256(args.activation)}",
     )
     return snapshot.to_dict()
 
 
-def _attach_design_evidence(args: argparse.Namespace) -> dict[str, Any]:
-    """绑定当前大纲的来源角色图与 Ground Truth 账本。"""
+def _attach_question_brief(args: argparse.Namespace) -> dict[str, Any]:
+    """在 outline Skill 后绑定题号根目录中的最新版 JSON/Markdown Brief。"""
+    snapshot = RunWorkflow(RunStore(args.run_dir)).attach_brief(
+        Actor.TEACHER,
+        args.brief,
+        f"brief:{file_sha256(args.brief)}",
+    )
+    return snapshot.to_dict()
+
+
+def _freeze_and_start_validation(args: argparse.Namespace) -> dict[str, Any]:
+    """冻结可启动题包并原子打开同会话线性 Harbor 验证。"""
     store = RunStore(args.run_dir)
     current = store.read_snapshot()
     if current is None:
         raise SystemExit("run is not initialized")
-    digest = file_sha256(args.source_role_map) + file_sha256(args.ground_truth_ledger)
-    snapshot = RunWorkflow(store).attach_design_evidence(
+    snapshot = RunWorkflow(store).freeze_and_start_validation_session(
         Actor.TEACHER,
-        source_role_map_path=args.source_role_map,
-        ground_truth_ledger_path=args.ground_truth_ledger,
-        idempotency_key=f"design:evidence:{current.question_revision}:{digest}",
+        package=args.package,
+        validation_session_id=args.validation_session_id,
+        researcher_thread_id=args.researcher_thread_id,
+        idempotency_key=(
+            f"validation:session:{current.question_revision}:"
+            f"{args.validation_session_id}"
+        ),
     )
     return snapshot.to_dict()
 
 
 def _resolve_teacher_skill(args: argparse.Namespace) -> dict[str, Any]:
-    path = resolve_teacher_activation(args.question, args.stage, args.attempt_id)
-    return {"activation_path": str(path), "activation": _read_json(path)}
+    path = resolve_teacher_activation(
+        args.question,
+        args.stage,
+        args.attempt_id,
+        args.batch_id,
+        tuple(args.task_input),
+        batch_questions=tuple(args.batch_question),
+    )
+    activation = _read_json(path)
+    return {
+        "activation_path": str(path),
+        "prompt_path": activation["prompt_bundle"]["path"],
+        "activation": activation,
+    }
 
 
 def _validate_question_brief(args: argparse.Namespace) -> dict[str, Any]:
@@ -367,84 +446,77 @@ def _validate_question_brief(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _accept_health(args: argparse.Namespace) -> dict[str, Any]:
-    """按当前修订幂等接受同一份 Reviewer 快速健康回执。"""
-    health = HealthEvidence(**_read_json(args.health))
-    store = RunStore(args.run_dir)
-    current = store.read_snapshot()
-    if current is None:
-        raise SystemExit("run is not initialized")
-    refs = tuple(args.evidence_ref)
-    accepted_state = RunState.ORACLE_PASSED if health.passed else RunState.PREFLIGHT_PASSED
-    if (
-        current.state is accepted_state
-        and current.evidence.get("health") == asdict(health)
-        and tuple(current.evidence.get("health_evidence_refs", ())) == refs
-    ):
-        return current.to_dict()
-    snapshot = RunWorkflow(store).accept_health(
-        Actor.REVIEWER,
-        health,
-        refs,
-        f"health:{current.question_revision}:{args.health.name}",
-    )
-    return snapshot.to_dict()
+def _record_skill_attribution(args: argparse.Namespace) -> dict[str, Any]:
+    path = record_skill_attribution(args.question, args.evidence)
+    return {"question": f"q{args.question}", "attribution_path": str(path)}
 
 
-def _accept_bound_health(args: argparse.Namespace) -> dict[str, Any]:
-    value = _read_json(args.bundle)
-    health = HealthEvidence(**value["health"])
-    references = tuple(
-        EvidenceReference(
-            gate=HealthGate(item["gate"]),
-            path=item["path"],
-            sha256=item["sha256"],
-        )
-        for item in value["references"]
-    )
-    bundle = BoundHealthEvidence(
-        question_revision=value["question_revision"],
-        package_sha256=value["package_sha256"],
-        environment_key=value["environment_key"],
-        health=health,
-        references=references,
-        created_at=value["created_at"],
-        schema_version=value.get("schema_version", 1),
-    )
-    snapshot = RunWorkflow(RunStore(args.run_dir)).accept_bound_health(
-        Actor.REVIEWER,
-        bundle,
-        "bound-health:" + args.bundle.name,
-    )
-    return snapshot.to_dict()
+def _reconcile_skill_bank(args: argparse.Namespace) -> dict[str, Any]:
+    return reconcile_skill_batch(args.batch_id, tuple(args.question))
 
 
-def _start_blind(args: argparse.Namespace) -> dict[str, Any]:
-    """按当前修订幂等开启首次 blind 验证。"""
-    store = RunStore(args.run_dir)
-    current = store.read_snapshot()
-    if current is None:
-        raise SystemExit("run is not initialized")
-    if current.state is RunState.BLIND_VALIDATION:
-        return current.to_dict()
-    snapshot = RunWorkflow(store).start_blind_validation(
+def _evaluate_skill_candidate(args: argparse.Namespace) -> dict[str, Any]:
+    return evaluate_skill_candidate(args.plan, args.verdict)
+
+
+def _record_validation_round(args: argparse.Namespace) -> dict[str, Any]:
+    """从 canonical Harbor 原始产物导入线性会话的一轮结果。"""
+    snapshot = RunWorkflow(RunStore(args.run_dir)).record_validation_round(
         Actor.TEACHER,
-        f"validation:blind:{current.question_revision}:start",
+        request_id=args.request_id,
+        idempotency_key=f"validation:round:{args.request_id}",
     )
     return snapshot.to_dict()
 
 
-def _audit_researcher(args: argparse.Namespace) -> dict[str, Any]:
-    """由 Reviewer 接纳一次 capability、回执和泄漏审计闭合的 Harbor 尝试。"""
-    snapshot = RunWorkflow(RunStore(args.run_dir)).audit_researcher_receipt(
-        Actor.REVIEWER,
-        request_path=args.request,
-        capability_path=args.capability,
-        receipt_path=args.receipt,
-        leakage_evidence_path=args.leakage_evidence,
-        hint_review_path=args.hint_review,
-        revision_correction_path=args.revision_correction,
-        idempotency_key=f"attempt:audit:{file_sha256(args.receipt)}",
+def _decide_persistent_validation_round(args: argparse.Namespace) -> dict[str, Any]:
+    """Let Teacher advance or stop a live persistent Harbor validation trial."""
+    path = RunWorkflow(RunStore(args.run_dir)).decide_persistent_validation_round(
+        Actor.TEACHER,
+        request_id=args.request_id,
+        round_index=args.round_index,
+        decision=TeacherDecision(
+            action=args.action,
+            hint=args.hint,
+            teacher_declares_non_answer=(
+                True if args.teacher_declares_non_answer else None
+            ),
+        ),
+    )
+    return {"decision_path": str(path.resolve()), "sha256": file_sha256(path)}
+
+
+def _record_persistent_validation_session(args: argparse.Namespace) -> dict[str, Any]:
+    """Atomically import all rounds after the persistent Harbor trial stops."""
+    snapshot = RunWorkflow(RunStore(args.run_dir)).record_persistent_validation_session(
+        Actor.TEACHER,
+        request_id=args.request_id,
+        idempotency_key=f"validation:persistent-session:{args.request_id}",
+    )
+    return snapshot.to_dict()
+
+
+def _repair_validation_history_delivery(args: argparse.Namespace) -> dict[str, Any]:
+    """对不计科学轮次的 argv 溢出执行有来源绑定的历史交付修复。"""
+    store = RunStore(args.run_dir)
+    current = store.read_snapshot()
+    if current is None:
+        raise SystemExit("run is not initialized")
+    session = current.evidence.get("validation_session", {})
+    source_digests = session.get("round_receipt_sha256s", ())
+    identity = hashlib.sha256(
+        json.dumps(
+            {
+                "question_revision": current.question_revision,
+                "source_digests": source_digests,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    snapshot = RunWorkflow(store).repair_validation_history_delivery(
+        Actor.TEACHER,
+        idempotency_key=f"validation:history-delivery:compact-v1:{identity}",
     )
     return snapshot.to_dict()
 
@@ -470,6 +542,18 @@ def _accept_runtime_delta(args: argparse.Namespace) -> dict[str, Any]:
     return snapshot.to_dict()
 
 
+def _migrate_incomplete_validation(args: argparse.Namespace) -> dict[str, Any]:
+    """关闭旧验证会话并创建采用当前线性合同的新修订。"""
+    snapshot = RunWorkflow(
+        RunStore(args.run_dir)
+    ).migrate_incomplete_validation_session(
+        Actor.TEACHER,
+        args.revision,
+        f"validation:migrate:{args.revision}",
+    )
+    return snapshot.to_dict()
+
+
 def _accept_runtime_closure(args: argparse.Namespace) -> dict[str, Any]:
     """接纳 fresh 科学 trace 对应的 Stable 构建闭合。"""
     snapshot = RunWorkflow(RunStore(args.run_dir)).accept_runtime_closure(
@@ -490,12 +574,16 @@ def _bind_runtime_environment(args: argparse.Namespace) -> dict[str, Any]:
     return snapshot.to_dict()
 
 
-def _accept_post_validation(args: argparse.Namespace) -> dict[str, Any]:
-    """接纳独立最终复审并结束单题 progression。"""
-    snapshot = RunWorkflow(RunStore(args.run_dir)).accept_post_validation(
-        Actor.REVIEWER,
-        args.evidence,
-        f"validation:post:{file_sha256(args.evidence)}",
+def _begin_runtime_finalization(args: argparse.Namespace) -> dict[str, Any]:
+    """验证通过后进入环境固化，不重复科学解题。"""
+    workflow = RunWorkflow(RunStore(args.run_dir))
+    current = workflow.snapshot
+    snapshot = workflow.begin_runtime_finalization(
+        Actor.TEACHER,
+        (
+            "runtime:finalization:start:"
+            f"{current.question_revision}:{current.package_digest}"
+        ),
     )
     return snapshot.to_dict()
 
@@ -515,19 +603,43 @@ def _import_environment(args: argparse.Namespace) -> dict[str, Any]:
 def _build_harbor(args: argparse.Namespace) -> dict[str, Any]:
     spec_value = _read_json(args.spec)
     spec_value["context_paths"] = tuple(spec_value.get("context_paths", ()))
+    persistent_value = spec_value.pop("persistent_validation", None)
+    persistent = (
+        PersistentValidationSpec(**persistent_value)
+        if isinstance(persistent_value, dict)
+        else None
+    )
     runtime = runtime_from_dict(_read_json(args.runtime))
-    config = build_job_config(HarborJobSpec(**spec_value), runtime)
+    config = build_job_config(
+        HarborJobSpec(**spec_value),
+        runtime,
+        persistent_validation=persistent,
+    )
     write_job_config(args.output, config)
     return {"config_path": str(args.output.resolve()), "job_name": config["job_name"]}
 
 
 def _issue_researcher(args: argparse.Namespace) -> dict[str, Any]:
-    value = _read_json(args.request)
-    handoff = CapabilityStore(args.handoff_root).issue(Actor.TEACHER, ResearcherRequest.from_dict(value))
+    handoff = RunWorkflow(RunStore(args.run_dir)).issue_researcher_request(
+        Actor.TEACHER,
+        request_id=args.request_id,
+        job_config_path=args.job_config,
+        approved_hint_path=args.approved_hint,
+    )
     output = asdict(handoff)
     handoff_path = Path(handoff.request_path).parent / "handoff.json"
     write_json(handoff_path, output)
     return output | {"handoff_path": str(handoff_path)}
+
+
+def _revoke_researcher(args: argparse.Namespace) -> dict[str, Any]:
+    """撤销尚未兑换且未进入 Harbor 的 Researcher capability。"""
+    handoff = IssuedHandoff(**_read_json(args.handoff))
+    CapabilityStore(Path(handoff.capability_path).parents[1]).revoke(
+        handoff,
+        reason=args.reason,
+    )
+    return {"request_path": handoff.request_path, "status": "REVOKED"}
 
 
 def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
@@ -545,6 +657,11 @@ def _researcher_run(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit("CODEX_THREAD_ID is required for Researcher attestation")
     if args.receipt.exists():
         raise SystemExit("Researcher receipt already exists and is immutable")
+    # Validate the host-controlled runtime before consuming the single-use
+    # Researcher capability or occupying a global Harbor queue slot.  A local
+    # argument/configuration error must remain recoverable without fabricating
+    # a scientific attempt.
+    runtime = runtime_from_dict(_read_json(args.runtime))
     handoff = IssuedHandoff(**_read_json(args.handoff))
     queued_request = _read_json(Path(handoff.request_path))
     request_id = queued_request.get("request_id")
@@ -554,12 +671,18 @@ def _researcher_run(args: argparse.Namespace) -> dict[str, Any]:
     queue = HarborJobQueue(args.queue_root)
     if args.claim_id:
         claim_id = args.claim_id
-        queue.authorize(request_id, claim_id=claim_id, job_config_path=Path(job_config_path))
+        queue.authorize(
+            request_id, claim_id=claim_id, job_config_path=Path(job_config_path)
+        )
     else:
         queue.submit(request_id, Path(job_config_path))
         claim = queue.claim_request(request_id, worker_id=thread_id)
         if claim is None:
-            return {"request_id": request_id, "classification": "QUEUED", "reward": None}
+            return {
+                "request_id": request_id,
+                "classification": "QUEUED",
+                "reward": None,
+            }
         claim_id = claim.claim_id
         assert claim_id is not None
     store = CapabilityStore(Path(handoff.capability_path).parents[1])
@@ -571,7 +694,7 @@ def _researcher_run(args: argparse.Namespace) -> dict[str, Any]:
     )
     receipt = execute_harbor(
         request=request,
-        runtime=runtime_from_dict(_read_json(args.runtime)),
+        runtime=runtime,
         env_file=args.env_file,
         overall_timeout_sec=args.overall_timeout_sec,
     )
@@ -592,7 +715,11 @@ def _harbor_queue_status(args: argparse.Namespace) -> dict[str, Any]:
 
 def _harbor_queue_submit(args: argparse.Namespace) -> dict[str, Any]:
     """提交一个单任务、单 trial 的独立 Harbor Job。"""
-    return HarborJobQueue(args.queue_root).submit(args.request_id, args.job_config).to_dict()
+    return (
+        HarborJobQueue(args.queue_root)
+        .submit(args.request_id, args.job_config)
+        .to_dict()
+    )
 
 
 def _harbor_queue_claim(args: argparse.Namespace) -> dict[str, Any]:
@@ -607,11 +734,15 @@ def _harbor_queue_claim(args: argparse.Namespace) -> dict[str, Any]:
 
 def _harbor_queue_complete(args: argparse.Namespace) -> dict[str, Any]:
     """以科学完成、平台失败或待恢复状态结束认领。"""
-    return HarborJobQueue(args.queue_root).complete(
-        args.request_id,
-        claim_id=args.claim_id,
-        terminal_state=HarborQueueState(args.state),
-    ).to_dict()
+    return (
+        HarborJobQueue(args.queue_root)
+        .complete(
+            args.request_id,
+            claim_id=args.claim_id,
+            terminal_state=HarborQueueState(args.state),
+        )
+        .to_dict()
+    )
 
 
 def _scheduler_status(args: argparse.Namespace) -> dict[str, Any]:
@@ -643,12 +774,16 @@ def _scheduler_tick(args: argparse.Namespace) -> dict[str, Any]:
 
 def _scheduler_heartbeat(args: argparse.Namespace) -> dict[str, Any]:
     """由当前唯一 owner 刷新 Teacher 租约。"""
-    return QuestionScheduler(args.scheduler_root).heartbeat(
-        args.question_id,
-        owner_id=args.owner_id,
-        lease_id=args.lease_id,
-        generation=args.generation,
-    ).to_dict()
+    return (
+        QuestionScheduler(args.scheduler_root)
+        .heartbeat(
+            args.question_id,
+            owner_id=args.owner_id,
+            lease_id=args.lease_id,
+            generation=args.generation,
+        )
+        .to_dict()
+    )
 
 
 def _scheduler_wait_external(args: argparse.Namespace) -> dict[str, Any]:
@@ -696,7 +831,6 @@ def _scheduler_bind_published_family(args: argparse.Namespace) -> dict[str, Any]
     """验证已发布题族，并在同一事务完成对应 campaign 槽位。"""
     result = QuestionScheduler(args.scheduler_root).bind_published_family(
         args.question_id,
-        args.family,
         owner_id=args.owner_id,
         lease_id=args.lease_id,
         generation=args.generation,
@@ -710,7 +844,9 @@ def _scheduler_bind_published_family(args: argparse.Namespace) -> dict[str, Any]
 
 def _scheduler_set_limit(args: argparse.Namespace) -> dict[str, Any]:
     """确认固定三槽约束；其他数值由 scheduler 拒绝。"""
-    result = QuestionScheduler(args.scheduler_root).configure(max_active=args.max_active)
+    result = QuestionScheduler(args.scheduler_root).configure(
+        max_active=args.max_active
+    )
     return {
         "activated": result.activated,
         "released": result.released,

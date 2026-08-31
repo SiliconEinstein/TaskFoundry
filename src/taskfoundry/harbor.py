@@ -44,7 +44,11 @@ class DshRuntime:
             if file_sha256(path) != digest:
                 raise ContractError(f"DSH runtime artifact SHA-256 mismatch: {path}")
         adapter_paths = self.adapter_pythonpath.split(os.pathsep)
-        if not adapter_paths or any(not Path(path).is_dir() for path in adapter_paths) or ":" not in self.agent_import:
+        if (
+            not adapter_paths
+            or any(not Path(path).is_dir() for path in adapter_paths)
+            or ":" not in self.agent_import
+        ):
             raise ContractError("DSH adapter import is invalid")
 
 
@@ -65,7 +69,10 @@ class CodexRuntime:
 
     def validate(self) -> None:
         """拒绝正式 Codex 运行的模型、推理强度或凭证配置漂移。"""
-        if self.model_name not in {"deepseek-v4-pro-202606", "matmaster/gpt-5.6-sol"}:
+        if self.model_name not in {
+            "deepseek-v4-pro-202606",
+            "matmaster/gpt-5.6-sol",
+        }:
             raise ContractError("unsupported Codex Researcher model")
         if self.reasoning_effort != "high":
             raise ContractError("Codex Researcher reasoning effort must be high")
@@ -79,7 +86,9 @@ class CodexRuntime:
                 or not adapter_paths
                 or any(not Path(path).is_dir() for path in adapter_paths)
             ):
-                raise ContractError("GPT-5.6 requires the strong gateway namespace adapter")
+                raise ContractError(
+                    "GPT-5.6 requires the strong gateway namespace adapter"
+                )
         portable = (
             self.portable_binary_path,
             self.portable_binary_sha256,
@@ -88,7 +97,9 @@ class CodexRuntime:
             self.portable_code_mode_host_sha256,
         )
         if any(portable) and not all(portable):
-            raise ContractError("portable Codex runtime fields must be provided together")
+            raise ContractError(
+                "portable Codex runtime fields must be provided together"
+            )
         if self.portable_binary_path:
             binary = Path(self.portable_binary_path)
             host = Path(str(self.portable_code_mode_host_path))
@@ -97,7 +108,9 @@ class CodexRuntime:
                 ("code-mode host", host, self.portable_code_mode_host_sha256),
             ):
                 if not path.is_file() or file_sha256(path) != expected:
-                    raise ContractError(f"portable Codex {label} is missing or has checksum drift")
+                    raise ContractError(
+                        f"portable Codex {label} is missing or has checksum drift"
+                    )
             adapter_paths = (self.adapter_pythonpath or "").split(os.pathsep)
             if (
                 not adapter_paths
@@ -144,7 +157,7 @@ class HarborJobSpec:
     jobs_dir: str
     task_path: str
     context_paths: tuple[str, ...]
-    lbg_project_id: int
+    lbg_project_id: int | None
     model_name: str = "deepseek/deepseek-v4-pro"
     environment_type: str = "lbg"
 
@@ -155,11 +168,19 @@ class HarborJobSpec:
         if self.model_name not in {
             "deepseek/deepseek-v4-pro",
             "deepseek-v4-pro-202606",
+            # 保留历史 JobConfig 的解析兼容；正式默认仍是 matmaster 命名空间。
+            "gpt-5.6-sol",
             "matmaster/gpt-5.6-sol",
         }:
-            raise ContractError("Researcher model must be an approved v4-pro or GPT-5.6 identifier")
-        if self.environment_type != "lbg" or self.lbg_project_id <= 0:
-            raise ContractError("V1 Harbor environment must be an authorized LBG project")
+            raise ContractError(
+                "Researcher model must be an approved v4-pro or GPT-5.6 identifier"
+            )
+        if self.environment_type != "lbg" or (
+            self.lbg_project_id is not None and self.lbg_project_id <= 0
+        ):
+            raise ContractError(
+                "V1 Harbor environment must be an authorized LBG project"
+            )
         if not Path(self.task_path).is_dir():
             raise ContractError("Harbor task path does not exist")
         if not Path(self.jobs_dir).is_dir():
@@ -169,7 +190,52 @@ class HarborJobSpec:
                 raise ContractError(f"approved context file does not exist: {context}")
 
 
-def build_job_config(spec: HarborJobSpec, runtime: ResearcherRuntime) -> dict[str, Any]:
+@dataclass(frozen=True)
+class PersistentValidationSpec:
+    """Host-side control contract for one persistent Harbor validation trial."""
+
+    validation_session_id: str
+    controller_dir: str
+    pass_threshold: float = 0.85
+    max_blind_rounds: int = 3
+    max_hint_rounds: int = 2
+    decision_timeout_sec: int = 10800
+    schema_version: int = 1
+
+    def validate(self) -> None:
+        """Match Harbor's strict bounds before serializing the JobConfig."""
+        controller = Path(self.controller_dir)
+        if self.schema_version != 1 or not self.validation_session_id.strip():
+            raise ContractError("persistent validation identity is invalid")
+        if not controller.is_absolute():
+            raise ContractError("persistent validation controller dir must be absolute")
+        if not 0 < self.pass_threshold <= 1:
+            raise ContractError("persistent validation threshold must be in (0, 1]")
+        if self.max_blind_rounds != 3 or self.max_hint_rounds not in {1, 2}:
+            raise ContractError("persistent validation requires three blind rounds")
+        if not 1 <= self.decision_timeout_sec <= 86400:
+            raise ContractError("persistent validation decision timeout is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the exact custom Agent payload consumed by Harbor."""
+        self.validate()
+        return {
+            "schema_version": self.schema_version,
+            "validation_session_id": self.validation_session_id,
+            "controller_dir": str(Path(self.controller_dir).resolve()),
+            "pass_threshold": self.pass_threshold,
+            "max_blind_rounds": self.max_blind_rounds,
+            "max_hint_rounds": self.max_hint_rounds,
+            "decision_timeout_sec": self.decision_timeout_sec,
+        }
+
+
+def build_job_config(
+    spec: HarborJobSpec,
+    runtime: ResearcherRuntime,
+    *,
+    persistent_validation: PersistentValidationSpec | None = None,
+) -> dict[str, Any]:
     """构造正式 Researcher 消费的精确 Harbor JobConfig。"""
     spec.validate()
     runtime.validate()
@@ -208,26 +274,40 @@ def build_job_config(spec: HarborJobSpec, runtime: ResearcherRuntime) -> dict[st
                     "portable_code_mode_host_sha256": runtime.portable_code_mode_host_sha256,
                 }
             )
-        codex_env = (
-            {
+        if runtime.credential_profile == "strong":
+            codex_env = {
                 "OPENAI_API_KEY": "${STRONG_API_KEY}",
                 "OPENAI_BASE_URL": "${STRONG_BASE_URL}",
                 "HTTP_PROXY": "${STRONG_PROXY}",
                 "HTTPS_PROXY": "${STRONG_PROXY}",
                 "ALL_PROXY": "${STRONG_PROXY}",
             }
-            if runtime.credential_profile == "strong"
-            else {
+        else:
+            codex_env = {
                 "OPENAI_API_KEY": "${LLM_API_KEY}",
                 "OPENAI_BASE_URL": "${LLM_BASE_URL}",
             }
-        )
         agent = {
             "name": runtime.agent_import,
             "model_name": runtime.model_name,
             "kwargs": kwargs,
             "env": codex_env,
         }
+        if persistent_validation is not None:
+            if not runtime.portable_binary_path:
+                raise ContractError(
+                    "persistent validation requires the portable Codex runtime"
+                )
+            persistent_validation.validate()
+            Path(persistent_validation.controller_dir).mkdir(
+                parents=True,
+                exist_ok=True,
+                mode=0o700,
+            )
+            agent["name"] = "taskfoundry.persistent_codex_agent:PersistentPortableCodex"
+            agent["kwargs"]["persistent_validation"] = persistent_validation.to_dict()
+    if persistent_validation is not None and isinstance(runtime, DshRuntime):
+        raise ContractError("persistent validation currently requires Codex")
     return {
         "job_name": spec.job_name,
         "jobs_dir": str(Path(spec.jobs_dir).resolve()),
@@ -244,7 +324,9 @@ def build_job_config(spec: HarborJobSpec, runtime: ResearcherRuntime) -> dict[st
         },
         "agents": [agent],
         "tasks": [{"path": str(Path(spec.task_path).resolve())}],
-        "extra_instruction_paths": [str(Path(path).resolve()) for path in spec.context_paths],
+        "extra_instruction_paths": [
+            str(Path(path).resolve()) for path in spec.context_paths
+        ],
     }
 
 
@@ -279,7 +361,15 @@ def command_for(config_path: Path, env_file: Path) -> tuple[str, ...]:
     """返回 argv 元组，绝不把凭证插值进 shell。"""
     if not config_path.is_file() or not env_file.is_file():
         raise ContractError("Harbor config and credential env file must exist")
-    return ("harbor", "run", "--config", str(config_path), "--env-file", str(env_file), "--yes")
+    return (
+        "harbor",
+        "run",
+        "--config",
+        str(config_path),
+        "--env-file",
+        str(env_file),
+        "--yes",
+    )
 
 
 def file_sha256(path: Path) -> str:

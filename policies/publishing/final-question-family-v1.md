@@ -37,6 +37,15 @@ Q3–Q32 必须使用 `publication_mode: family-v1`，目录结构如下：
 honest solver `1.0`，以及至少一次 fresh、无泄漏、分数不低于 `0.85` 的 Harbor
 科学结果。派生层 formal evidence 必须声明 `derived_only_from_reviewed_hint=true`。
 
+### 关联资源目录
+
+每个难度题包根目录都必须带有相同的 `resources.json`。该文件只登记题目关联的外部
+科学资源，`type` 只能是 `paper`、`tool`、`dataset`、`model`。其中 `paper` 是论文，
+`tool` 是公开科学软件，`dataset` 是具有公开外部身份的数据集，`model` 是具有外部身份
+的模型。镜像、Python、shell、系统包和其他通用运行时由环境封签记录，不进入该文件；
+题目自行生成的数据由题包 provenance 记录，也不作为 `dataset` 登记。完整字段和身份
+要求以 `FINAL_RESOURCE_CATALOG_RULES.md` 为准，发布 validator 必须失败关闭。
+
 `FAMILY_MANIFEST.json` 通过 `scientific_contract_sha256` 绑定唯一科学合同。每一层
 及其 evidence 都必须重复绑定准确的 question ID、level、package digest 和科学合同
 digest。Oracle 与 honest solver 必须是两份独立 evidence，不能用同一路径或单一
@@ -53,8 +62,11 @@ digest。Oracle 与 honest solver 必须是两份独立 evidence，不能用同�
 整个题族内的 Harbor 执行身份必须全局唯一。`job_id`、`trial_id`、`sandbox_id` 和
 `session_id` 四个字段分别执行唯一性检查，不能通过只替换四元组中的另一个字段绕过。
 每条科学结果还必须绑定原始 Researcher request 和状态为 `CONSUMED` 的 capability；
-capability 必须绑定 request 的实际文件 SHA 和指定 Researcher thread。blind request
-的 `context_digests` 必须严格为空，三个 blind 的 `attempt_index` 必须依次为 1、2、3。
+capability 必须绑定 request 的实际文件 SHA 和指定 Researcher thread。blind 1 的
+`context_digests` 必须严格为空；blind 2 和 blind 3 必须按顺序精确等于此前已接受
+blind round-history 的摘要，且这些记录必须来自同一 validation session、同一
+Researcher thread、`mode=blind`，不得包含 hint、答案或其他上下文摘要。三个 blind
+的 `attempt_index` 必须依次为 1、2、3。
 
 Hint evidence 只使用正式 workflow 可生成的 `mode=hint`，不定义 publication-only 的
 `mode=derived`。第一条 hint 的 `hint_index=1`、`parent_hint_sha256=null`；若发布

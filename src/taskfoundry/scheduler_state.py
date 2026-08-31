@@ -13,7 +13,9 @@ from .model import ContractError
 
 
 CAMPAIGN_QUESTION_COUNT = 32
-CAMPAIGN_SLOT_LIMIT = 3
+CAMPAIGN_SLOT_LIMIT = 5
+CAMPAIGN_MIN_SLOT_LIMIT = 1
+CAMPAIGN_DEFAULT_ACTIVE = 1
 DEFAULT_LEASE_TTL_SEC = 600
 CAMPAIGN_ID = "q01-q32-runtime-first"
 _QUESTION_ID = re.compile(r"q([1-9]|[12][0-9]|3[0-2])$")
@@ -208,18 +210,22 @@ class ScheduledQuestion:
 
 @dataclass(frozen=True)
 class SchedulerSnapshot:
-    """Q1--Q32 单一看板和固定三槽调度快照。"""
+    """Q1--Q32 单一看板和一至五槽调度快照。"""
 
     sequence: int
     questions: tuple[ScheduledQuestion, ...]
     lease_ttl_sec: int = DEFAULT_LEASE_TTL_SEC
-    max_active: int = CAMPAIGN_SLOT_LIMIT
+    max_active: int = CAMPAIGN_DEFAULT_ACTIVE
     campaign_id: str = CAMPAIGN_ID
     schema_version: int = 2
 
     def validate(self) -> None:
-        """校验全局题集、三槽和唯一 owner/fencing。"""
-        if self.schema_version != 2 or self.sequence < 0 or self.max_active != CAMPAIGN_SLOT_LIMIT:
+        """校验全局题集、槽位和唯一 owner/fencing。"""
+        if (
+            self.schema_version != 2
+            or self.sequence < 0
+            or not CAMPAIGN_MIN_SLOT_LIMIT <= self.max_active <= CAMPAIGN_SLOT_LIMIT
+        ):
             raise ContractError("unsupported scheduler snapshot")
         if self.campaign_id != CAMPAIGN_ID or not 30 <= self.lease_ttl_sec <= 86400:
             raise ContractError("unsupported campaign or lease TTL")
@@ -231,7 +237,7 @@ class SchedulerSnapshot:
         leased = [item for item in self.questions if item.state is QueueState.LEASED]
         lease_ids = [item.lease.lease_id for item in leased if item.lease]
         owners = [item.lease.owner_id for item in leased if item.lease]
-        if len(leased) > CAMPAIGN_SLOT_LIMIT or len(lease_ids) != len(set(lease_ids)):
+        if len(leased) > self.max_active or len(lease_ids) != len(set(lease_ids)):
             raise ContractError("campaign lease limit or lease uniqueness is violated")
         if len(owners) != len(set(owners)):
             raise ContractError("one Teacher owner cannot hold multiple campaign leases")
@@ -281,7 +287,7 @@ def snapshot_from_dict(value: dict[str, Any], *, now: datetime, lease_ttl_sec: i
         sequence=value["sequence"],
         questions=questions,
         lease_ttl_sec=value.get("lease_ttl_sec", lease_ttl_sec),
-        max_active=value.get("max_active", CAMPAIGN_SLOT_LIMIT),
+        max_active=value.get("max_active", CAMPAIGN_DEFAULT_ACTIVE),
         campaign_id=value.get("campaign_id", CAMPAIGN_ID),
         schema_version=2,
     )

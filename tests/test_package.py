@@ -1,17 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from taskfoundry.model import ContractError
-from taskfoundry.package import (
-    lint_package,
-    migrate_legacy_task,
-    package_sha256,
-    scientific_contract_sha256,
-)
+from taskfoundry.package import lint_package, package_sha256, scientific_contract_sha256
 
 
 TASK_TOML = '''schema_version = "1.3"
@@ -25,7 +21,7 @@ timeout_sec = 3600
 '''
 
 
-def make_task(root: Path, *, legacy: bool = False) -> Path:
+def make_task(root: Path) -> Path:
     root.mkdir()
     (root / "instruction.md").write_text("Use resources.yaml and write output.\n")
     (root / "task.toml").write_text(TASK_TOML)
@@ -33,14 +29,8 @@ def make_task(root: Path, *, legacy: bool = False) -> Path:
     (root / "solution/solve.sh").write_text("#!/bin/sh\ntrue\n")
     (root / "tests").mkdir()
     (root / "tests/test.sh").write_text("#!/bin/sh\necho 1 > /logs/verifier/reward.txt\n")
-    if legacy:
-        (root / "public_data").mkdir()
-        (root / "public_data/input.csv").write_text("x\n1\n")
-        (root / "environment").mkdir()
-        (root / "environment/Dockerfile").write_text("FROM example\n")
-    else:
-        (root / "environment").mkdir()
-        (root / "environment/resources.yaml").write_text("resources: []\n")
+    (root / "environment").mkdir()
+    (root / "environment/resources.yaml").write_text("resources: []\n")
     return root
 
 
@@ -117,62 +107,42 @@ def test_task_toml_contract(tmp_path, replacement, rule) -> None:
     assert rule in {item.rule_id for item in lint_package(task).issues}
 
 
-def test_migration_creates_standard_visible_environment(tmp_path) -> None:
-    source = make_task(tmp_path / "legacy", legacy=True)
+def test_scientific_contract_normalizes_public_resource_layout(tmp_path) -> None:
+    legacy = make_task(tmp_path / "legacy")
+    (legacy / "public_data").mkdir()
+    (legacy / "public_data/input.csv").write_text("x\n1\n")
+    visible = make_task(tmp_path / "visible")
+    (visible / "environment/public_data").mkdir()
+    (visible / "environment/public_data/input.csv").write_text("x\n1\n")
+
+    assert scientific_contract_sha256(legacy) == scientific_contract_sha256(visible)
+
+
+def test_scientific_contract_uses_manifest_digests(tmp_path) -> None:
+    task = make_task(tmp_path / "task")
+    public = task / "environment/public_data"
+    public.mkdir()
+    resource = public / "input.csv"
+    resource.write_text("x\n1\n")
+    digest = hashlib.sha256(resource.read_bytes()).hexdigest()
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "status": "ENVIRONMENT_READY",
-                "image": {"immutable": True},
-                "inventory": [{"kind": "tool", "name": "python", "command": "python3"}],
-            }
-        )
-    )
-    target = tmp_path / "standard"
-    report = migrate_legacy_task(source, target, manifest)
-    assert report.passed
-    assert (target / "environment/public_data/input.csv").is_file()
-    assert not (target / "environment/Dockerfile").exists()
-    resources = (target / "environment/resources.yaml").read_text()
-    assert "public_data/input.csv" in resources and "python3" in resources
-    assert scientific_contract_sha256(source) == scientific_contract_sha256(target)
+    manifest.write_text(json.dumps({"resources": [{"source": "assets/input.csv", "sha256": digest}]}))
+
+    first = scientific_contract_sha256(task, manifest)
+    resource.unlink()
+    assert scientific_contract_sha256(task, manifest) == first
 
 
-def test_migration_requires_ready_immutable_environment(tmp_path) -> None:
-    source = make_task(tmp_path / "legacy", legacy=True)
+def test_scientific_contract_rejects_mismatch_and_missing_required_file(tmp_path) -> None:
+    task = make_task(tmp_path / "task")
+    public = task / "environment/public_data"
+    public.mkdir()
+    (public / "input.csv").write_text("x\n1\n")
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"status": "BUILDING", "image": {"immutable": False}}))
-    with pytest.raises(ContractError, match="immutable ready"):
-        migrate_legacy_task(source, tmp_path / "target", manifest)
+    manifest.write_text(json.dumps({"resources": [{"source": "input.csv", "sha256": "0" * 64}]}))
 
-
-def test_migration_accepts_equivalent_nested_reference_tree(tmp_path) -> None:
-    source = make_task(tmp_path / "source")
-    (source / "reference").mkdir()
-    (source / "reference/model.py").write_text("VALUE = 1\n")
-    (source / "reference/generate.py").write_text("print('generate')\n")
-    (source / "solution/reference").mkdir()
-    (source / "solution/reference/model.py").write_text("VALUE = 1\n")
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"status": "ENVIRONMENT_READY", "image": {"immutable": True}}))
-
-    report = migrate_legacy_task(source, tmp_path / "target", manifest)
-
-    assert report.passed
-    assert (tmp_path / "target/solution/reference/model.py").read_text() == "VALUE = 1\n"
-    assert (tmp_path / "target/solution/reference/generate.py").is_file()
-
-
-def test_migration_rejects_conflicting_reference_trees_before_writing(tmp_path) -> None:
-    source = make_task(tmp_path / "source")
-    (source / "reference").mkdir()
-    (source / "reference/model.py").write_text("VALUE = 1\n")
-    (source / "solution/reference").mkdir()
-    (source / "solution/reference/model.py").write_text("VALUE = 2\n")
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"status": "ENVIRONMENT_READY", "image": {"immutable": True}}))
-
-    with pytest.raises(ContractError, match="conflicting root and solution reference"):
-        migrate_legacy_task(source, tmp_path / "target", manifest)
-    assert not (tmp_path / "target").exists()
+    with pytest.raises(ContractError, match="digest mismatch"):
+        scientific_contract_sha256(task, manifest)
+    (task / "instruction.md").unlink()
+    with pytest.raises(ContractError, match="file is missing"):
+        scientific_contract_sha256(task)

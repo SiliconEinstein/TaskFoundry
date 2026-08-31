@@ -27,7 +27,7 @@
     },
     "blind": {
       "type": "object",
-      "description": "Evidence must bind a schema-v1 Researcher request, its CONSUMED capability, context_digests=[], and fresh job/trial/sandbox/session fields.",
+      "description": "Evidence must bind a schema-v1 Researcher request, its CONSUMED capability, fresh job/trial/sandbox/session fields, and the linear blind context chain: blind 1 has context_digests=[], while later blinds bind exactly the accepted prior blind round histories from the same validation session and Researcher thread with no hint or answer digest.",
       "additionalProperties": false,
       "required": ["score", "evidence"],
       "properties": {

@@ -70,14 +70,14 @@ def test_empty_scheduler_exposes_single_q1_q32_campaign_board(tmp_path: Path) ->
     snapshot = QuestionScheduler(tmp_path / "scheduler").snapshot()
 
     assert snapshot.schema_version == 2
-    assert snapshot.max_active == 3
+    assert snapshot.max_active == 1
     assert [item.question_id for item in snapshot.questions] == [f"q{i}" for i in range(1, 33)]
     assert all(item.state is QueueState.COMPLETED for item in snapshot.questions[:2])
     assert all(item.completion_basis == "GRANDFATHERED" for item in snapshot.questions[:2])
     assert all(item.state is QueueState.BACKLOG for item in snapshot.questions[2:])
 
 
-def test_scheduler_fills_exactly_three_uniquely_owned_leases(tmp_path: Path) -> None:
+def test_scheduler_uses_one_active_slot_by_default(tmp_path: Path) -> None:
     clock = FakeClock()
     scheduler = QuestionScheduler(tmp_path / "scheduler", clock=clock)
     for index in range(3, 7):
@@ -86,15 +86,16 @@ def test_scheduler_fills_exactly_three_uniquely_owned_leases(tmp_path: Path) -> 
     snapshot = scheduler.snapshot()
     leased = [item for item in snapshot.questions if item.state is QueueState.LEASED]
 
-    assert [item.question_id for item in leased] == ["q3", "q4", "q5"]
-    assert len({item.lease.lease_id for item in leased if item.lease}) == 3
-    assert len({item.lease.owner_id for item in leased if item.lease}) == 3
-    assert next(item for item in snapshot.questions if item.question_id == "q6").state is QueueState.READY
+    assert [item.question_id for item in leased] == ["q3"]
+    assert len({item.lease.lease_id for item in leased if item.lease}) == 1
+    assert len({item.lease.owner_id for item in leased if item.lease}) == 1
+    assert next(item for item in snapshot.questions if item.question_id == "q4").state is QueueState.READY
 
 
 def test_heartbeat_refreshes_lease_and_rejects_stale_fencing(tmp_path: Path) -> None:
     clock = FakeClock()
     scheduler = QuestionScheduler(tmp_path / "scheduler", clock=clock, lease_ttl_sec=60)
+    scheduler.configure(max_active=3)
     _enqueue(scheduler, tmp_path, "q3")
     item = next(value for value in scheduler.snapshot().questions if value.question_id == "q3")
     assert item.lease is not None
@@ -122,6 +123,7 @@ def test_heartbeat_refreshes_lease_and_rejects_stale_fencing(tmp_path: Path) -> 
 def test_expired_lease_requires_recovery_and_automatically_refills(tmp_path: Path) -> None:
     clock = FakeClock()
     scheduler = QuestionScheduler(tmp_path / "scheduler", clock=clock, lease_ttl_sec=60)
+    scheduler.configure(max_active=3)
     for index in range(3, 7):
         _enqueue(scheduler, tmp_path, f"q{index}")
 
@@ -160,6 +162,7 @@ def test_reclaimed_question_rejects_previous_generation(tmp_path: Path) -> None:
 def test_waiting_external_releases_slot_and_resume_reenters_queue(tmp_path: Path) -> None:
     clock = FakeClock()
     scheduler = QuestionScheduler(tmp_path / "scheduler", clock=clock)
+    scheduler.configure(max_active=3)
     for index in range(3, 7):
         _enqueue(scheduler, tmp_path, f"q{index}")
     q3 = next(item for item in scheduler.snapshot().questions if item.question_id == "q3")
@@ -232,7 +235,7 @@ def test_v1_snapshot_migrates_with_backup_and_without_fake_heartbeat(tmp_path: P
     migrated = scheduler.snapshot()
     q18 = next(item for item in migrated.questions if item.question_id == "q18")
     assert migrated.schema_version == 2
-    assert migrated.max_active == 3
+    assert migrated.max_active == 1
     assert q18.state is QueueState.RECOVERY_REQUIRED
     assert q18.lease is None
 
@@ -243,16 +246,24 @@ def test_v1_snapshot_migrates_with_backup_and_without_fake_heartbeat(tmp_path: P
     assert len(persisted["questions"]) == 32
 
 
-def test_completed_run_waits_for_validated_publication_before_releasing_slot(tmp_path: Path) -> None:
+def test_completed_run_waits_for_validated_publication_before_releasing_slot(
+    tmp_path: Path, monkeypatch
+) -> None:
     validated: list[tuple[int, Path]] = []
+    family = tmp_path / "questions" / "4" / "question-pack"
+    trace = tmp_path / "questions" / "4" / "trace/final/package-digest"
+    family.mkdir(parents=True)
+    trace.mkdir(parents=True)
 
-    def validate_family(question: int, family: Path) -> None:
-        validated.append((question, family))
+    def validate_family(question: int, candidate: Path, run: object) -> Path:
+        validated.append((question, candidate))
+        return trace
 
-    scheduler = QuestionScheduler(
-        tmp_path / "scheduler",
-        publication_validator=validate_family,
-    )
+    monkeypatch.setattr("taskfoundry.scheduler.published_family_path", lambda _number: family)
+    monkeypatch.setattr("taskfoundry.scheduler._default_finalize_published_family", validate_family)
+    monkeypatch.setattr(QuestionScheduler, "_reconcile_batch_at_completion", lambda *args: None)
+    scheduler = QuestionScheduler(tmp_path / "scheduler")
+    scheduler.configure(max_active=3)
     runs = {}
     for index in range(3, 7):
         question_id = f"q{index}"
@@ -277,12 +288,9 @@ def test_completed_run_waits_for_validated_publication_before_releasing_slot(tmp
     assert q4.published_family is None
     assert validated == []
 
-    family = tmp_path / "published" / "q4-family"
-    family.mkdir(parents=True)
     assert q4.lease is not None
     result = scheduler.bind_published_family(
         "q4",
-        family,
         owner_id=q4.lease.owner_id,
         lease_id=q4.lease.lease_id,
         generation=q4.generation,
@@ -298,14 +306,18 @@ def test_completed_run_waits_for_validated_publication_before_releasing_slot(tmp
     assert validated == [(4, family.resolve())]
 
 
-def test_publication_binding_rejects_invalid_family_without_mutating_slot(tmp_path: Path) -> None:
-    def reject_family(question: int, family: Path) -> None:
+def test_publication_binding_rejects_invalid_family_without_mutating_slot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    family = tmp_path / "questions/3/question-pack"
+
+    def reject_family(question: int, candidate: Path, run: object) -> Path:
         raise ContractError(f"family validation rejected q{question}: {family}")
 
-    scheduler = QuestionScheduler(
-        tmp_path / "scheduler",
-        publication_validator=reject_family,
-    )
+    monkeypatch.setattr("taskfoundry.scheduler.published_family_path", lambda _number: family)
+    monkeypatch.setattr("taskfoundry.scheduler._default_finalize_published_family", reject_family)
+    monkeypatch.setattr(QuestionScheduler, "_reconcile_batch_at_completion", lambda *args: None)
+    scheduler = QuestionScheduler(tmp_path / "scheduler")
     run = _run(tmp_path, "q3")
     scheduler.enqueue(
         "q3",
@@ -316,14 +328,12 @@ def test_publication_binding_rejects_invalid_family_without_mutating_slot(tmp_pa
     _set_state(run, RunState.COMPLETED, "test:q3:completed")
     waiting = scheduler.tick()
     q3 = waiting.snapshot.questions[2]
-    family = tmp_path / "published" / "q3-family"
     family.mkdir(parents=True)
     assert q3.lease is not None
 
     with pytest.raises(ContractError, match="family validation rejected"):
         scheduler.bind_published_family(
             "q3",
-            family,
             owner_id=q3.lease.owner_id,
             lease_id=q3.lease.lease_id,
             generation=q3.generation,
@@ -335,22 +345,30 @@ def test_publication_binding_rejects_invalid_family_without_mutating_slot(tmp_pa
     assert unchanged.completion_basis is None
 
 
-def test_publication_binding_requires_current_lease_and_completed_run(tmp_path: Path) -> None:
+def test_publication_binding_requires_current_lease_and_completed_run(
+    tmp_path: Path, monkeypatch
+) -> None:
     validated: list[tuple[int, Path]] = []
-    scheduler = QuestionScheduler(
-        tmp_path / "scheduler",
-        publication_validator=lambda question, family: validated.append((question, family)),
-    )
+    family = tmp_path / "questions/3/question-pack"
+    trace = tmp_path / "questions/3/trace/final/package-digest"
+    family.mkdir(parents=True)
+    trace.mkdir(parents=True)
+
+    def finalize(question: int, candidate: Path, run: object) -> Path:
+        validated.append((question, candidate))
+        return trace
+
+    monkeypatch.setattr("taskfoundry.scheduler.published_family_path", lambda _number: family)
+    monkeypatch.setattr("taskfoundry.scheduler._default_finalize_published_family", finalize)
+    monkeypatch.setattr(QuestionScheduler, "_reconcile_batch_at_completion", lambda *args: None)
+    scheduler = QuestionScheduler(tmp_path / "scheduler")
     _enqueue(scheduler, tmp_path, "q3")
     q3 = scheduler.snapshot().questions[2]
-    family = tmp_path / "published" / "q3-family"
-    family.mkdir(parents=True)
     assert q3.lease is not None
 
     with pytest.raises(ContractError, match="completed run"):
         scheduler.bind_published_family(
             "q3",
-            family,
             owner_id=q3.lease.owner_id,
             lease_id=q3.lease.lease_id,
             generation=q3.generation,
@@ -358,7 +376,6 @@ def test_publication_binding_requires_current_lease_and_completed_run(tmp_path: 
     with pytest.raises(ContractError, match="lease fencing"):
         scheduler.bind_published_family(
             "q3",
-            family,
             owner_id="stale-owner",
             lease_id=q3.lease.lease_id,
             generation=q3.generation,
@@ -366,7 +383,6 @@ def test_publication_binding_requires_current_lease_and_completed_run(tmp_path: 
     with pytest.raises(ContractError, match="grandfathered"):
         scheduler.bind_published_family(
             "q1",
-            family,
             owner_id=q3.lease.owner_id,
             lease_id=q3.lease.lease_id,
             generation=q3.generation,
@@ -374,10 +390,64 @@ def test_publication_binding_requires_current_lease_and_completed_run(tmp_path: 
     assert validated == []
 
 
-@pytest.mark.parametrize("limit", [0, 2, 4, 200])
-def test_campaign_rejects_any_teacher_limit_other_than_three(tmp_path: Path, limit: int) -> None:
-    with pytest.raises(ContractError, match="fixed at 3"):
+def test_last_published_question_triggers_automatic_skill_batch_reconcile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    scheduler = QuestionScheduler(tmp_path / "scheduler")
+    run_dir = _run(tmp_path, "q3")
+    scheduler.enqueue(
+        "q3",
+        run_dir,
+        teacher_thread_id="owner-q3",
+        teacher_prompt_path=_prompt(tmp_path, "q3"),
+    )
+    store = RunStore(run_dir)
+    current = store.read_snapshot()
+    assert current is not None
+    contract = {
+        "outline": {
+            "batch_id": "batch-1", "batch_questions": [3],
+            "stable_generation": 1, "stable_lock_sha256": "a" * 64,
+        },
+        "author": {
+            "batch_id": "batch-1", "batch_questions": [3],
+            "stable_generation": 1, "stable_lock_sha256": "a" * 64,
+        },
+    }
+    completed = store.advance(
+        current,
+        state=RunState.COMPLETED,
+        evidence={"teacher_skill_contract": contract},
+    )
+    store.commit(
+        actor=Actor.SYSTEM,
+        event_type="test.completed",
+        idempotency_key="test:batch:completed",
+        payload={},
+        snapshot=completed,
+    )
+    calls: list[tuple[str, tuple[int, ...]]] = []
+    monkeypatch.setattr(
+        "taskfoundry.scheduler.reconcile_skill_batch_if_ready",
+        lambda batch, questions: calls.append((batch, questions)) or {"status": "PASS"},
+    )
+    item = scheduler.snapshot().questions[2]
+
+    QuestionScheduler._reconcile_batch_at_completion(scheduler.snapshot(), item, completed)
+
+    assert calls == [("batch-1", (3,))]
+
+
+@pytest.mark.parametrize("limit", [0, 6, 200])
+def test_campaign_rejects_teacher_limit_outside_one_to_five(tmp_path: Path, limit: int) -> None:
+    with pytest.raises(ContractError, match="between 1 and 5"):
         QuestionScheduler(tmp_path / "scheduler").configure(max_active=limit)
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 4, 5])
+def test_campaign_accepts_teacher_limit_between_one_and_five(tmp_path: Path, limit: int) -> None:
+    result = QuestionScheduler(tmp_path / "scheduler").configure(max_active=limit)
+    assert result.snapshot.max_active == limit
 
 
 def test_scheduler_rejects_invalid_public_inputs(tmp_path: Path) -> None:
@@ -500,7 +570,7 @@ def test_state_contract_rejects_invalid_question_and_snapshot_shapes() -> None:
         ScheduledQuestion("q3", QueueState.READY, 3, now, teacher_thread_id="owner").validate()
     base = QuestionScheduler(Path("/tmp/scheduler-contract-only")).snapshot()
     with pytest.raises(ContractError, match="unsupported scheduler"):
-        SchedulerSnapshot(sequence=0, questions=base.questions, max_active=2).validate()
+        SchedulerSnapshot(sequence=0, questions=base.questions, max_active=0).validate()
     with pytest.raises(ContractError, match="ordered q1-q32"):
         SchedulerSnapshot(sequence=0, questions=base.questions[:-1]).validate()
     with pytest.raises(ContractError, match="schema_version"):
@@ -539,7 +609,7 @@ def test_state_contract_rejects_inconsistent_optional_fields() -> None:
                 now,
                 completion_basis="RUN_COMPLETED",
                 last_run_state="COMPLETED",
-                published_family="/questions/3/new-question/family",
+                published_family="/questions/3/question-pack",
             ),
             "completion basis",
         ),
@@ -565,7 +635,7 @@ def test_snapshot_rejects_duplicate_owner_and_broken_grandfather(tmp_path: Path)
             lease=TeacherLease(lease_id, "same-owner", now, later),
         )
     with pytest.raises(ContractError, match="one Teacher owner"):
-        replace(base, questions=tuple(questions)).validate()
+        replace(base, questions=tuple(questions), max_active=2).validate()
 
     broken = list(base.questions)
     broken[0] = replace(broken[0], state=QueueState.BACKLOG, completion_basis=None)

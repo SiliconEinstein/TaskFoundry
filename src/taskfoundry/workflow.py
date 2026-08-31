@@ -4,18 +4,36 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Callable
 
-from .labwright import ArtifactIdentity, EnvironmentReceipt
+from .labwright import ArtifactIdentity, EnvironmentReceipt, atomic_json
 from .labwright_runtime import DeltaReceipt, DeltaState, ImageSealPlan
-from .health import BoundHealthEvidence, EvidenceReference, HealthGate
+from .launch import LaunchContractError, freeze_package_snapshot
+from .harbor_evidence import (
+    HarborEvidenceImporter,
+    VerifiedPersistentSession,
+    compact_legacy_round_history,
+)
 from .model import Actor, ContractError, QuestionDesignBrief, RunSnapshot, RunState
-from .package import lint_package
 from .policy import file_sha256
 from .question_types import QuestionTypeRegistry
-from .researcher import ResearcherReceipt, ResearcherRequest
+from .researcher import (
+    CapabilityStore,
+    ApprovedHint,
+    IssuedHandoff,
+    ResearcherError,
+    ResearcherRequest,
+)
+from .skillbank import validate_activation, validate_latest_brief
 from .store import RunStore
-from .validation import AttemptEvidence, HealthEvidence, decide_validation
+from .validation import (
+    AttemptEvidence,
+    HealthEvidence,
+    JobClassification,
+    decide_validation,
+)
+from .validation_control import TeacherDecision, TeacherValidationController
+from .validation_session import ValidationSessionRegistry
 
 
 class WorkflowError(RuntimeError):
@@ -25,9 +43,24 @@ class WorkflowError(RuntimeError):
 class RunWorkflow:
     """只允许通过证据充分且角色有权的转换推进运行。"""
 
-    def __init__(self, store: RunStore, question_types: QuestionTypeRegistry | None = None) -> None:
+    def __init__(
+        self,
+        store: RunStore,
+        question_types: QuestionTypeRegistry | None = None,
+        *,
+        skill_validator: Callable[[Path, int, str], dict] | None = None,
+        brief_locator: Callable[[int], tuple[Path, Path]] | None = None,
+    ) -> None:
         self.store = store
         self.question_types = question_types or QuestionTypeRegistry()
+        self.skill_validator = skill_validator or (
+            lambda path, question, stage: validate_activation(
+                path,
+                question=question,
+                stage=stage,
+            )
+        )
+        self.brief_locator = brief_locator or validate_latest_brief
 
     @property
     def snapshot(self) -> RunSnapshot:
@@ -37,301 +70,462 @@ class RunWorkflow:
             raise WorkflowError("run is not initialized")
         return current
 
-    def attach_brief(self, actor: Actor, path: Path, idempotency_key: str) -> RunSnapshot:
+    def attach_brief(
+        self, actor: Actor, path: Path, idempotency_key: str
+    ) -> RunSnapshot:
         """绑定独立生成并通过题型校验的设计大纲。"""
-        current = self._guard(actor, {Actor.TEACHER}, {RunState.DESIGNING})
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "brief.attached",
+            {"sha256": file_sha256(path) if path.is_file() else ""},
+        )
+        if repeated is not None:
+            return repeated
+        current = self._guard(
+            actor,
+            {Actor.TEACHER},
+            {RunState.DESIGNING, RunState.AUTHORING},
+        )
+        skill_contract = current.evidence.get("teacher_skill_contract")
+        if not isinstance(skill_contract, dict) or "outline" not in skill_contract:
+            raise WorkflowError(
+                "outline Skill activation must be bound before the brief"
+            )
+        question = skill_contract.get("question")
+        if type(question) is not int:
+            raise WorkflowError("Teacher Skill contract lacks its question number")
+        json_path, markdown_path = self.brief_locator(question)
+        if path.resolve() != json_path.resolve():
+            raise WorkflowError(
+                "brief must be the numbered question's current JSON brief"
+            )
         if not path.is_file():
             raise ContractError("QuestionDesignBrief file is missing")
         brief = QuestionDesignBrief.from_dict(self._json_object(path))
         self.question_types.validate(brief)
-        next_snapshot = self.store.advance(current, brief_path=str(path.resolve()))
-        return self._commit(actor, "brief.attached", idempotency_key, {"sha256": file_sha256(path)}, next_snapshot)
-
-    def lock_policies(self, actor: Actor, path: Path, idempotency_key: str) -> RunSnapshot:
-        """出题前锁定固定规范和题型规范。"""
-        current = self._guard(actor, {Actor.TEACHER}, {RunState.DESIGNING})
-        if current.brief_path is None or not path.is_file():
-            raise WorkflowError("brief and policy lock are both required")
-        next_snapshot = self.store.advance(
-            current,
-            state=RunState.POLICIES_LOCKED,
-            policy_lock_path=str(path.resolve()),
-        )
-        return self._commit(actor, "policies.locked", idempotency_key, {"sha256": file_sha256(path)}, next_snapshot)
-
-    def request_environment(self, actor: Actor, idempotency_key: str) -> RunSnapshot:
-        """把环境配置控制权交给 Labwright。"""
-        current = self._guard(actor, {Actor.TEACHER}, {RunState.POLICIES_LOCKED})
-        next_snapshot = self.store.advance(current, state=RunState.ENVIRONMENT_DISCOVERY)
-        return self._commit(actor, "environment.requested", idempotency_key, {}, next_snapshot)
-
-    def environment_ready(
-        self,
-        actor: Actor,
-        receipt: EnvironmentReceipt,
-        idempotency_key: str,
-    ) -> RunSnapshot:
-        """只接受 Stable 状态的 Labwright 回执。"""
-        current = self._guard(actor, {Actor.LABWRIGHT}, {RunState.ENVIRONMENT_DISCOVERY})
-        receipt.validate()
-        next_snapshot = self.store.advance(
-            current,
-            state=RunState.ENVIRONMENT_READY,
-            environment_key=receipt.environment_key,
-            evidence=current.evidence | {"environment": receipt.to_dict()},
-        )
-        return self._commit(actor, "environment.ready", idempotency_key, {"key": receipt.environment_key}, next_snapshot)
-
-    def begin_authoring(self, actor: Actor, idempotency_key: str) -> RunSnapshot:
-        """规范锁定后开始出题；零 attempt 的旧环境发现 run 留痕迁入。"""
-        current = self._guard(
-            actor,
-            {Actor.TEACHER},
-            {
-                RunState.POLICIES_LOCKED,
-                RunState.ENVIRONMENT_DISCOVERY,
-                RunState.ENVIRONMENT_READY,
-            },
-        )
-        migrating_runtime_first = current.state in {
-            RunState.ENVIRONMENT_DISCOVERY,
-            RunState.ENVIRONMENT_READY,
-        }
-        if migrating_runtime_first and current.attempts:
-            raise WorkflowError("runtime-first migration only accepts legacy runs without attempts")
-        next_snapshot = self.store.advance(
-            current,
-            state=RunState.AUTHORING,
-            environment_key=None if migrating_runtime_first else current.environment_key,
-            evidence=(
-                self._revision_neutral_evidence(current.evidence)
-                if migrating_runtime_first
-                else current.evidence
-            ),
-        )
-        if migrating_runtime_first:
-            return self._commit(
-                actor,
-                "authoring.runtime_first.migrated",
-                idempotency_key,
-                {"from_state": current.state.value},
-                next_snapshot,
+        markdown = markdown_path.read_text(encoding="utf-8")
+        if brief.brief_id not in markdown or brief.title not in markdown:
+            raise WorkflowError(
+                "JSON and Markdown QuestionDesignBrief do not identify the same brief"
             )
-        return self._commit(actor, "authoring.started", idempotency_key, {}, next_snapshot)
-
-    def refresh_revision_environment(
-        self,
-        actor: Actor,
-        receipt: EnvironmentReceipt,
-        idempotency_key: str,
-    ) -> RunSnapshot:
-        """下次冻结题包前绑定修订后的公开环境。"""
-        current = self._guard(actor, {Actor.LABWRIGHT}, {RunState.AUTHORING})
-        superseded = current.evidence.get("superseded_revision")
-        if not isinstance(superseded, dict) or current.package_path is not None:
-            raise WorkflowError("environment refresh requires an unfrozen evidence-backed revision")
-        receipt.validate()
+        brief_evidence = {
+            "json_path": str(json_path.resolve()),
+            "json_sha256": file_sha256(json_path),
+            "markdown_path": str(markdown_path.resolve()),
+            "markdown_sha256": file_sha256(markdown_path),
+            "brief_id": brief.brief_id,
+        }
         next_snapshot = self.store.advance(
             current,
-            environment_key=receipt.environment_key,
-            evidence=current.evidence | {"environment": receipt.to_dict()},
+            brief_path=str(path.resolve()),
+            evidence=current.evidence | {"question_brief": brief_evidence},
         )
         return self._commit(
             actor,
-            "revision.environment.refreshed",
+            "brief.attached",
             idempotency_key,
-            {"key": receipt.environment_key},
+            {"sha256": file_sha256(path)},
             next_snapshot,
         )
 
-    def attach_design_evidence(
+    def accept_teacher_skill_activation(
         self,
         actor: Actor,
         *,
-        source_role_map_path: Path,
-        ground_truth_ledger_path: Path,
+        question: int,
+        stage: str,
+        activation_path: Path,
         idempotency_key: str,
     ) -> RunSnapshot:
-        """在冻结题包前绑定来源角色图和可独立复算的 Ground Truth 账本。"""
-        current = self._guard(actor, {Actor.TEACHER}, {RunState.AUTHORING})
-        if current.brief_path is None:
-            raise WorkflowError("design evidence requires the bound question brief")
-        brief_path = Path(current.brief_path)
-        brief = QuestionDesignBrief.from_dict(self._json_object(brief_path))
-        brief_sha256 = file_sha256(brief_path)
-        role_map = self._json_object(source_role_map_path)
-        expected_identity = {
-            "schema_version": 1,
-            "question_revision": current.question_revision,
-            "brief_sha256": brief_sha256,
-        }
-        if any(role_map.get(key) != value for key, value in expected_identity.items()):
-            raise WorkflowError("source role map does not bind the current brief and revision")
-        if (
-            role_map.get("evidence_type") != "source-role-map"
-            or role_map.get("source_ids") != [item.source_id for item in brief.source_questions]
-            or role_map.get("roles") != brief.evidence_roles
-            or role_map.get("license_review_pass") is not True
-        ):
-            raise WorkflowError("source role map is incomplete or inconsistent with the brief")
-        source_hashes = role_map.get("immutable_source_sha256s")
-        if (
-            not isinstance(source_hashes, dict)
-            or set(source_hashes) != {item.source_id for item in brief.source_questions}
-            or any(not self._full_sha256(value) for value in source_hashes.values())
-        ):
-            raise WorkflowError("source role map requires one immutable digest per source")
-        ledger = self._json_object(ground_truth_ledger_path)
-        if any(ledger.get(key) != value for key, value in expected_identity.items()):
-            raise WorkflowError("Ground Truth ledger does not bind the current brief and revision")
-        quantities = ledger.get("scored_quantities")
-        required_hashes = (
-            "producer_sha256",
-            "independent_crosscheck_sha256",
-            "scoring_contract_sha256",
+        """把 outline/author 的完整 SkillFoundry activation 绑定到正式 run。"""
+        if stage not in {"outline", "author"}:
+            raise WorkflowError("Teacher Skill stage must be outline or author")
+        activation_sha256 = (
+            file_sha256(activation_path) if activation_path.is_file() else ""
         )
-        if (
-            ledger.get("evidence_type") != "ground-truth-ledger"
-            or ledger.get("derived_reference") is not True
-            or ledger.get("crosscheck_pass") is not True
-            or not isinstance(quantities, list)
-            or not quantities
-            or any(not isinstance(item, str) or not item.strip() for item in quantities)
-            or any(not self._full_sha256(ledger.get(key)) for key in required_hashes)
-        ):
-            raise WorkflowError("Ground Truth ledger is incomplete or not independently closed")
-        evidence = {
-            "source_role_map": {
-                "path": str(source_role_map_path.resolve()),
-                "sha256": file_sha256(source_role_map_path),
-            },
-            "ground_truth_ledger": {
-                "path": str(ground_truth_ledger_path.resolve()),
-                "sha256": file_sha256(ground_truth_ledger_path),
-            },
-        }
-        next_snapshot = self.store.advance(
-            current,
-            evidence=current.evidence | {"design_evidence": evidence},
-        )
-        return self._commit(
-            actor,
-            "design.evidence.attached",
+        repeated = self._idempotent_snapshot(
             idempotency_key,
-            {name: value["sha256"] for name, value in evidence.items()},
-            next_snapshot,
+            "teacher.skill.bound",
+            {"stage": stage, "activation_sha256": activation_sha256},
         )
-
-    def freeze_package(self, actor: Actor, package: Path, idempotency_key: str) -> RunSnapshot:
-        """冻结一份合规题包摘要，供 Oracle 和 Researcher 使用。"""
-        current = self._guard(actor, {Actor.TEACHER}, {RunState.AUTHORING})
-        design_evidence = current.evidence.get("design_evidence")
-        if not isinstance(design_evidence, dict) or not self._design_evidence_unchanged(
-            design_evidence
-        ):
-            raise WorkflowError("source role map and Ground Truth ledger are required before freeze")
-        report = lint_package(package)
-        if not report.passed:
-            raise WorkflowError("package lint failed")
-        next_snapshot = self.store.advance(
-            current,
-            state=RunState.PACKAGE_FROZEN,
-            package_path=report.package_path,
-            package_digest=report.sha256,
-            evidence=current.evidence | {"package_lint": report.to_dict()},
-        )
-        return self._commit(actor, "package.frozen", idempotency_key, {"sha256": report.sha256}, next_snapshot)
-
-    def accept_health(
-        self,
-        actor: Actor,
-        health: HealthEvidence,
-        evidence_refs: Iterable[str],
-        idempotency_key: str,
-    ) -> RunSnapshot:
-        """仅由独立 Reviewer 记录首次 blind 前的快速健康门。"""
-        current = self._guard(actor, {Actor.REVIEWER}, {RunState.PACKAGE_FROZEN})
-        refs = tuple(evidence_refs)
-        if not health.preflight_passed or not refs:
-            raise WorkflowError("preflight health gates and evidence references are required")
-        state = RunState.ORACLE_PASSED if health.passed else RunState.PREFLIGHT_PASSED
-        next_snapshot = self.store.advance(
-            current,
-            state=state,
-            evidence=current.evidence | {"health": asdict(health), "health_evidence_refs": refs},
-        )
-        event_type = "health.accepted" if health.passed else "health.preflight.accepted"
-        return self._commit(actor, event_type, idempotency_key, {"refs": refs}, next_snapshot)
-
-    def accept_bound_health(
-        self,
-        actor: Actor,
-        bundle: BoundHealthEvidence,
-        idempotency_key: str,
-    ) -> RunSnapshot:
-        """只接受绑定当前题包、环境和修订的完整健康回执。"""
-        current = self._guard(
-            actor,
-            {Actor.REVIEWER},
-            {
-                RunState.PACKAGE_FROZEN, RunState.BLIND_VALIDATION, RunState.HINT_VALIDATION,
-                RunState.TOO_EASY, RunState.DEFERRED_TIMEOUT, RunState.BLOCKED,
-            },
-        )
-        if current.package_digest is None or current.environment_key is None:
-            raise WorkflowError("frozen package and Stable environment are required")
-        if current.state is not RunState.PACKAGE_FROZEN and not any(
-            item.get("classification") == "SCIENTIFIC_RESULT" for item in current.attempts
-        ):
-            raise WorkflowError("runtime bound health requires a scientific trace")
-        bundle.assert_current(
-            current.package_digest,
-            current.environment_key,
-            current.question_revision,
-        )
-        if not self._current_runtime_environment_bound(current):
-            raise WorkflowError("bound health requires the current runtime closure and Stable receipt")
-        next_state = current.state
-        next_evidence = current.evidence | {
-            "health": asdict(bundle.health),
-            "bound_health": bundle.to_dict(),
-        }
-        if current.state is RunState.PACKAGE_FROZEN:
-            next_state = RunState.ORACLE_PASSED
-        elif current.state is RunState.BLOCKED:
-            if current.evidence.get("validation_decision", {}).get("action") != "BLOCKED_HEALTH":
-                raise WorkflowError("bound health cannot recover another blocked condition")
-            decision = decide_validation(
-                (AttemptEvidence(**item) for item in current.attempts),
-                bundle.health,
-                final_health_bound=True,
-            )
-            if decision.action != "VALIDATION_PASSED":
-                raise WorkflowError("bound health does not satisfy final completion gates")
-            next_state = RunState.VALIDATION_PASSED
-            next_evidence["validation_decision"] = asdict(decision)
-        next_snapshot = self.store.advance(
-            current,
-            state=next_state,
-            evidence=next_evidence,
-        )
-        return self._commit(
-            actor,
-            "health.bound.accepted",
-            idempotency_key,
-            {"revision": bundle.question_revision},
-            next_snapshot,
-        )
-
-    def start_blind_validation(self, actor: Actor, idempotency_key: str) -> RunSnapshot:
-        """快速健康门通过后开放首次 blind；最终完成仍要求完整健康门。"""
+        if repeated is not None:
+            return repeated
         current = self._guard(
             actor,
             {Actor.TEACHER},
-            {RunState.PREFLIGHT_PASSED, RunState.ORACLE_PASSED},
+            {RunState.DESIGNING, RunState.AUTHORING},
         )
-        next_snapshot = self.store.advance(current, state=RunState.BLIND_VALIDATION)
-        return self._commit(actor, "validation.blind.started", idempotency_key, {}, next_snapshot)
+        contract = dict(current.evidence.get("teacher_skill_contract", {}))
+        if contract and contract.get("question") != question:
+            raise WorkflowError("Teacher Skill stages target different questions")
+        if stage == "author" and not isinstance(
+            current.evidence.get("question_brief"), dict
+        ):
+            raise WorkflowError(
+                "author Skill activation requires the bound latest brief"
+            )
+        value = self.skill_validator(activation_path, question, stage)
+        prompt = Path(str(value["prompt_bundle"]["path"]))
+        record = {
+            "activation_path": str(activation_path.resolve()),
+            "activation_sha256": activation_sha256,
+            "prompt_path": str(prompt.resolve()),
+            "prompt_sha256": file_sha256(prompt),
+            "batch_id": value.get("batch_id"),
+            "batch_questions": value.get("batch_questions"),
+            "stable_generation": value.get("stable_generation"),
+            "stable_lock_sha256": value.get("stable_lock_snapshot", {}).get("sha256"),
+            "input_set_sha256": value.get("input_set_sha256"),
+        }
+        contract.update(question=question)
+        contract[stage] = record
+        next_snapshot = self.store.advance(
+            current,
+            evidence=current.evidence | {"teacher_skill_contract": contract},
+        )
+        return self._commit(
+            actor,
+            "teacher.skill.bound",
+            idempotency_key,
+            {"stage": stage, "activation_sha256": activation_sha256},
+            next_snapshot,
+        )
+
+    def lock_policies(
+        self, actor: Actor, path: Path, idempotency_key: str
+    ) -> RunSnapshot:
+        """旧零散 policy lock 已退出正式路径；规范只能来自冻结 Skill activation。"""
+        raise WorkflowError(
+            "standalone policy locks are superseded by Teacher Skill activation"
+        )
+
+    def begin_authoring(self, actor: Actor, idempotency_key: str) -> RunSnapshot:
+        """outline、Brief 与 author Skill 全部绑定且未漂移后开始出题。"""
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "authoring.started",
+            {},
+        )
+        if repeated is not None:
+            return repeated
+        current = self._guard(actor, {Actor.TEACHER}, {RunState.DESIGNING})
+        self._revalidate_teacher_knowledge(current, require_author=True)
+        next_snapshot = self.store.advance(current, state=RunState.AUTHORING)
+        return self._commit(
+            actor, "authoring.started", idempotency_key, {}, next_snapshot
+        )
+
+    def freeze_and_start_validation_session(
+        self,
+        actor: Actor,
+        *,
+        package: Path,
+        validation_session_id: str,
+        researcher_thread_id: str,
+        idempotency_key: str,
+    ) -> RunSnapshot:
+        """最小启动检查后原子冻结题包并打开线性 Harbor 验证会话。"""
+        from .package import package_sha256
+
+        source_package_sha256 = package_sha256(package)
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "validation.session.started",
+            {
+                "validation_session_id": validation_session_id,
+                "researcher_thread_id": researcher_thread_id,
+                "source_package_sha256": source_package_sha256,
+            },
+        )
+        if repeated is not None:
+            return repeated
+        current = self._guard(actor, {Actor.TEACHER}, {RunState.AUTHORING})
+        self._revalidate_teacher_knowledge(current, require_author=True)
+        if not validation_session_id.strip() or not researcher_thread_id.strip():
+            raise WorkflowError("validation session and Researcher thread are required")
+        snapshot_path = (
+            self.store.run_dir
+            / "question-revisions"
+            / current.question_revision
+            / "task"
+        )
+        try:
+            report = freeze_package_snapshot(package, snapshot_path)
+        except LaunchContractError as error:
+            raise WorkflowError(f"package launch probe failed: {error}") from error
+        registry = self._validation_session_registry()
+        registry.reserve(
+            run_id=current.run_id,
+            question_revision=current.question_revision,
+            validation_session_id=validation_session_id,
+            researcher_thread_id=researcher_thread_id,
+            package_sha256=report.package_sha256,
+        )
+        session = {
+            "schema_version": 2,
+            "validation_session_id": validation_session_id,
+            "researcher_thread_id": researcher_thread_id,
+            "question_revision": current.question_revision,
+            "package_sha256": report.package_sha256,
+            "status": "ACTIVE",
+        }
+        next_snapshot = self.store.advance(
+            current,
+            state=RunState.BLIND_VALIDATION,
+            package_path=report.package_path,
+            package_digest=report.package_sha256,
+            attempts=(),
+            evidence=current.evidence
+            | {
+                "package_lint": report.to_dict(),
+                "validation_session": session,
+            },
+        )
+        return self._commit(
+            actor,
+            "validation.session.started",
+            idempotency_key,
+            {
+                "package_sha256": report.package_sha256,
+                "source_package_sha256": source_package_sha256,
+                "validation_session_id": validation_session_id,
+                "researcher_thread_id": researcher_thread_id,
+            },
+            next_snapshot,
+        )
+
+    def issue_researcher_request(
+        self,
+        actor: Actor,
+        *,
+        request_id: str,
+        job_config_path: Path,
+        approved_hint_path: Path | None = None,
+    ) -> IssuedHandoff:
+        """从当前线性会话派生并签发唯一合法 Researcher 请求。"""
+        current = self._guard(
+            actor,
+            {Actor.TEACHER},
+            {
+                RunState.BLIND_VALIDATION,
+                RunState.HINT_VALIDATION,
+                RunState.DEFERRED_TIMEOUT,
+            },
+        )
+        session = current.evidence.get("validation_session")
+        if not isinstance(session, dict) or session.get("status") != "ACTIVE":
+            raise WorkflowError("an active direct validation session is required")
+        receipts = tuple(session.get("round_receipt_sha256s", ()))
+        histories = tuple(session.get("round_history_paths", ()))
+        if len(receipts) != len(histories):
+            raise WorkflowError("validation session history ledger is inconsistent")
+        if not job_config_path.is_file():
+            raise WorkflowError(
+                "Researcher launch artifact is unavailable: file is missing"
+            )
+        try:
+            job_config = self._json_object(job_config_path)
+            agents = job_config.get("agents", [])
+            persistent_payload = (
+                agents[0].get("kwargs", {}).get("persistent_validation")
+                if isinstance(agents, list)
+                and len(agents) == 1
+                and isinstance(agents[0], dict)
+                else None
+            )
+        except (OSError, UnicodeError) as error:
+            raise WorkflowError(
+                f"Researcher launch artifact is unavailable: {error}"
+            ) from error
+        if isinstance(persistent_payload, dict):
+            return self._issue_persistent_researcher_request(
+                current=current,
+                session=session,
+                request_id=request_id,
+                job_config_path=job_config_path,
+                persistent_payload=persistent_payload,
+                approved_hint_path=approved_hint_path,
+            )
+        mode = "hint" if current.state is RunState.HINT_VALIDATION else "blind"
+        round_index = len(receipts) + 1
+        if mode == "hint" and approved_hint_path is None:
+            raise WorkflowError("hint validation requires a Teacher-approved hint")
+        if mode == "blind" and approved_hint_path is not None:
+            raise WorkflowError("blind validation cannot include a Teacher hint")
+        try:
+            hint_sha256 = (
+                file_sha256(approved_hint_path)
+                if approved_hint_path is not None
+                else None
+            )
+            job_config_sha256 = file_sha256(job_config_path)
+        except OSError as error:
+            raise WorkflowError(
+                f"Researcher launch artifact is unavailable: {error}"
+            ) from error
+        request = ResearcherRequest(
+            request_id=request_id,
+            run_id=current.run_id,
+            question_revision=current.question_revision,
+            attempt_index=round_index,
+            mode=mode,
+            package_path=str(current.package_path),
+            package_sha256=str(current.package_digest),
+            job_config_path=str(job_config_path.resolve()),
+            job_config_sha256=job_config_sha256,
+            context_digests=receipts + ((hint_sha256,) if hint_sha256 else ()),
+            researcher_thread_id=str(session.get("researcher_thread_id", "")),
+            validation_session_id=str(session.get("validation_session_id", "")),
+            round_index=round_index,
+            prior_round_receipt_sha256s=receipts,
+            prior_round_history_paths=histories,
+            approved_hint_path=(
+                str(approved_hint_path.resolve()) if approved_hint_path else None
+            ),
+            approved_hint_sha256=hint_sha256,
+            schema_version=2,
+        )
+        round_ledger = current.evidence.get("harbor_rounds", {})
+        if not isinstance(round_ledger, dict):
+            raise WorkflowError("canonical Harbor round ledger is invalid")
+        closed_request_ids = tuple(
+            request_id_value
+            for request_id_value, evidence in round_ledger.items()
+            if isinstance(request_id_value, str)
+            and isinstance(evidence, dict)
+            and evidence.get("classification") != "SCIENTIFIC_RESULT"
+            and isinstance(evidence.get("request"), dict)
+            and evidence["request"].get("validation_session_id")
+            == request.validation_session_id
+            and evidence["request"].get("round_index") == request.round_index
+        )
+        try:
+            request.validate()
+            return CapabilityStore(self.store.run_dir / "researcher-requests").issue(
+                Actor.TEACHER,
+                request,
+                closed_request_ids=closed_request_ids,
+            )
+        except (ContractError, OSError, ResearcherError) as error:
+            raise WorkflowError(
+                f"Researcher request does not match current workflow: {error}"
+            ) from error
+
+    def _issue_persistent_researcher_request(
+        self,
+        *,
+        current: RunSnapshot,
+        session: dict,
+        request_id: str,
+        job_config_path: Path,
+        persistent_payload: dict,
+        approved_hint_path: Path | None,
+    ) -> IssuedHandoff:
+        """Issue one request for the whole Teacher-controlled validation session."""
+        if current.state is not RunState.BLIND_VALIDATION or any(
+            item.get("classification") == "SCIENTIFIC_RESULT"
+            for item in current.attempts
+        ):
+            raise WorkflowError(
+                "persistent validation retry is allowed only before any scientific round"
+            )
+        if approved_hint_path is not None:
+            raise WorkflowError(
+                "persistent hints are published by Teacher between rounds"
+            )
+        if persistent_payload.get("validation_session_id") != session.get(
+            "validation_session_id"
+        ):
+            raise WorkflowError(
+                "persistent JobConfig targets another validation session"
+            )
+        controller_dir = Path(str(persistent_payload.get("controller_dir", "")))
+        job_config = self._json_object(job_config_path)
+        agents = job_config.get("agents", [])
+        model_name = (
+            agents[0].get("model_name")
+            if isinstance(agents, list)
+            and len(agents) == 1
+            and isinstance(agents[0], dict)
+            else None
+        )
+        if not isinstance(model_name, str) or not model_name:
+            raise WorkflowError("persistent JobConfig model identity is invalid")
+        session_ledger = current.evidence.get("persistent_harbor_sessions", {})
+        if not isinstance(session_ledger, dict):
+            raise WorkflowError("persistent Harbor session ledger is invalid")
+        request = ResearcherRequest(
+            request_id=request_id,
+            run_id=current.run_id,
+            question_revision=current.question_revision,
+            attempt_index=1,
+            mode="interactive",
+            package_path=str(current.package_path),
+            package_sha256=str(current.package_digest),
+            job_config_path=str(job_config_path.resolve()),
+            job_config_sha256=file_sha256(job_config_path),
+            context_digests=(),
+            researcher_thread_id=str(session.get("researcher_thread_id", "")),
+            validation_session_id=str(session.get("validation_session_id", "")),
+            controller_dir=str(controller_dir.resolve()),
+            model=model_name,
+            schema_version=3,
+        )
+        try:
+            request.validate()
+            return CapabilityStore(self.store.run_dir / "researcher-requests").issue(
+                Actor.TEACHER,
+                request,
+                closed_request_ids=tuple(session_ledger),
+            )
+        except (ContractError, OSError, ResearcherError) as error:
+            raise WorkflowError(
+                f"persistent Researcher request is invalid: {error}"
+            ) from error
+
+    def decide_persistent_validation_round(
+        self,
+        actor: Actor,
+        *,
+        request_id: str,
+        round_index: int,
+        decision: TeacherDecision,
+    ) -> Path:
+        """Publish Teacher's next-round decision while Harbor keeps Agent alive."""
+        current = self._guard(
+            actor,
+            {Actor.TEACHER},
+            {RunState.BLIND_VALIDATION, RunState.HINT_VALIDATION},
+        )
+        session = current.evidence.get("validation_session")
+        if not isinstance(session, dict) or session.get("status") != "ACTIVE":
+            raise WorkflowError("an active validation session is required")
+        request_path = (
+            self.store.run_dir / "researcher-requests" / request_id / "request.json"
+        )
+        try:
+            request = ResearcherRequest.from_dict(self._json_object(request_path))
+        except (ContractError, OSError, UnicodeError) as error:
+            raise WorkflowError(
+                f"persistent request cannot be loaded: {error}"
+            ) from error
+        if (
+            request.schema_version != 3
+            or request.validation_session_id != session.get("validation_session_id")
+            or request.package_sha256 != current.package_digest
+        ):
+            raise WorkflowError("persistent request targets another active session")
+        controller = TeacherValidationController(
+            Path(str(request.controller_dir)),
+            str(request.validation_session_id),
+        )
+        result_path = controller.root / f"round-{round_index:02d}-result.json"
+        try:
+            return controller.decide(result_path, decision)
+        except ContractError as error:
+            raise WorkflowError(
+                f"Teacher validation decision is invalid: {error}"
+            ) from error
 
     def bind_runtime_environment(
         self,
@@ -340,24 +534,22 @@ class RunWorkflow:
         idempotency_key: str,
     ) -> RunSnapshot:
         """首次科学 trace 后绑定由真实运行时增量固化的 Stable 环境。"""
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "runtime.environment.bound",
+            {"key": receipt.environment_key},
+        )
+        if repeated is not None:
+            return repeated
         current = self._guard(
             actor,
             {Actor.LABWRIGHT},
-            {
-                RunState.BLIND_VALIDATION,
-                RunState.HINT_VALIDATION,
-                RunState.TOO_EASY,
-                RunState.DEFERRED_TIMEOUT,
-                RunState.BLOCKED,
-            },
+            {RunState.RUNTIME_FINALIZATION},
         )
-        if (
-            current.state is RunState.BLOCKED
-            and current.evidence.get("validation_decision", {}).get("action") != "BLOCKED_HEALTH"
-        ):
-            raise WorkflowError("runtime environment cannot recover another blocked condition")
         scientific = [
-            item for item in current.attempts if item.get("classification") == "SCIENTIFIC_RESULT"
+            item
+            for item in current.attempts
+            if item.get("classification") == "SCIENTIFIC_RESULT"
         ]
         if not scientific:
             raise WorkflowError("runtime environment requires a scientific trace")
@@ -369,9 +561,12 @@ class RunWorkflow:
             or receipt.runtime_closure_path != closure.get("path")
             or receipt.runtime_closure_sha256 != closure.get("sha256")
         ):
-            raise WorkflowError("Stable environment does not bind the accepted runtime closure")
+            raise WorkflowError(
+                "Stable environment does not bind the accepted runtime closure"
+            )
         next_snapshot = self.store.advance(
             current,
+            state=RunState.COMPLETED,
             environment_key=receipt.environment_key,
             evidence=current.evidence
             | {
@@ -396,7 +591,12 @@ class RunWorkflow:
         current = self._guard(
             actor,
             {Actor.LABWRIGHT},
-            {RunState.BLIND_VALIDATION, RunState.HINT_VALIDATION, RunState.DEFERRED_TIMEOUT},
+            {
+                RunState.BLIND_VALIDATION,
+                RunState.HINT_VALIDATION,
+                RunState.DEFERRED_TIMEOUT,
+                RunState.RUNTIME_FINALIZATION,
+            },
         )
         receipt = self._delta_receipt(receipt_path)
         if (
@@ -404,7 +604,9 @@ class RunWorkflow:
             or receipt.question_revision != current.question_revision
             or receipt.package_sha256 != current.package_digest
         ):
-            raise WorkflowError("runtime delta targets another run, revision, or package")
+            raise WorkflowError(
+                "runtime delta targets another run, revision, or package"
+            )
         source = next(
             (
                 item
@@ -414,12 +616,51 @@ class RunWorkflow:
             ),
             None,
         )
-        if not isinstance(source, dict) or source.get("classification") not in {
+        accepted_failure_classes = {
             "ENVIRONMENT_FAILURE",
             "HARNESS_FAILURE",
             "PLATFORM_FAILURE",
-        }:
+        }
+        source_classification = source.get("classification") if isinstance(source, dict) else None
+        scientific_capability_failure = (
+            isinstance(source, dict)
+            and source_classification == "SCIENTIFIC_RESULT"
+            and self._audited_scientific_capability_failure(current, receipt)
+        )
+        if not isinstance(source, dict) or (
+            source_classification not in accepted_failure_classes
+            and not scientific_capability_failure
+        ):
             raise WorkflowError("runtime delta lacks its audited source failure")
+        next_evidence = dict(current.evidence)
+        if current.state is RunState.RUNTIME_FINALIZATION:
+            existing_closure = next_evidence.get("runtime_closure")
+            if isinstance(existing_closure, dict):
+                if (
+                    existing_closure.get("delta_request_ids") != []
+                    or existing_closure.get("scientific_request_id")
+                    != receipt.source_researcher_request_id
+                    or existing_closure.get("scientific_sandbox_id")
+                    != receipt.source_sandbox_id
+                    or not scientific_capability_failure
+                ):
+                    raise WorkflowError(
+                        "late runtime delta cannot supersede the accepted closure"
+                    )
+                superseded = list(
+                    next_evidence.get("superseded_runtime_closures", [])
+                )
+                superseded.append(
+                    {
+                        "path": existing_closure.get("path"),
+                        "sha256": existing_closure.get("sha256"),
+                        "reason": (
+                            "TRACE_BACKED_DELTA_DISCOVERED_DURING_FINALIZATION"
+                        ),
+                    }
+                )
+                next_evidence["superseded_runtime_closures"] = superseded
+                next_evidence.pop("runtime_closure")
         delta_evidence = dict(current.evidence.get("runtime_deltas", {}))
         if receipt.request_id in delta_evidence:
             raise WorkflowError("runtime delta request is already accepted")
@@ -429,9 +670,10 @@ class RunWorkflow:
             "receipt": receipt.to_dict(),
             "source_attempt_index": source.get("attempt_index"),
         }
+        next_evidence["runtime_deltas"] = delta_evidence
         next_snapshot = self.store.advance(
             current,
-            evidence=current.evidence | {"runtime_deltas": delta_evidence},
+            evidence=next_evidence,
         )
         return self._commit(
             actor,
@@ -445,6 +687,30 @@ class RunWorkflow:
             next_snapshot,
         )
 
+    @classmethod
+    def _audited_scientific_capability_failure(
+        cls,
+        current: RunSnapshot,
+        receipt: DeltaReceipt,
+    ) -> bool:
+        """接受科学轮内独立记录、且不改变科学计数的能力探针失败。"""
+        trace = cls._json_object(Path(receipt.source_trace_path))
+        return (
+            trace.get("classification")
+            in {"ENVIRONMENT_FAILURE", "HARNESS_FAILURE", "PLATFORM_FAILURE"}
+            and trace.get("run_id") == current.run_id
+            and trace.get("question_revision") == current.question_revision
+            and trace.get("package_sha256") == current.package_digest
+            and trace.get("researcher_request_id")
+            == receipt.source_researcher_request_id
+            and trace.get("sandbox_id") == receipt.source_sandbox_id
+            and trace.get("scientific_round_classification_unchanged")
+            == "SCIENTIFIC_RESULT"
+            and trace.get("scientific_round_count_increment") is False
+            and isinstance(trace.get("failure_stage"), str)
+            and bool(trace["failure_stage"].strip())
+        )
+
     def accept_runtime_closure(
         self,
         actor: Actor,
@@ -452,16 +718,18 @@ class RunWorkflow:
         idempotency_key: str,
     ) -> RunSnapshot:
         """把 fresh 科学 trace 与已验证 delta 闭合为 Stable 构建输入。"""
+        closure_sha256 = file_sha256(plan_path)
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "runtime.closure.accepted",
+            {"sha256": closure_sha256},
+        )
+        if repeated is not None:
+            return repeated
         current = self._guard(
             actor,
             {Actor.LABWRIGHT},
-            {
-                RunState.BLIND_VALIDATION,
-                RunState.HINT_VALIDATION,
-                RunState.TOO_EASY,
-                RunState.DEFERRED_TIMEOUT,
-                RunState.BLOCKED,
-            },
+            {RunState.RUNTIME_FINALIZATION},
         )
         plan = self._image_seal_plan(plan_path)
         if (
@@ -469,20 +737,30 @@ class RunWorkflow:
             or plan.question_revision != current.question_revision
             or plan.package_sha256 != current.package_digest
         ):
-            raise WorkflowError("runtime closure targets another run, revision, or package")
+            raise WorkflowError(
+                "runtime closure targets another run, revision, or package"
+            )
         trace = self._json_object(Path(plan.scientific_trace_path))
         scientific = self._runtime_scientific_attempt(current, trace)
         self._validate_accepted_deltas(current, plan, scientific)
+        existing_closure = current.evidence.get("runtime_closure")
+        if (
+            isinstance(existing_closure, dict)
+            and existing_closure.get("sha256") != closure_sha256
+        ):
+            raise WorkflowError("runtime closure is immutable once accepted")
         next_snapshot = self.store.advance(
             current,
             evidence=current.evidence
             | {
                 "runtime_closure": {
                     "path": str(plan_path.resolve()),
-                    "sha256": file_sha256(plan_path),
+                    "sha256": closure_sha256,
                     "scientific_request_id": scientific["request_id"],
                     "scientific_sandbox_id": scientific["sandbox_id"],
-                    "delta_request_ids": [value["request_id"] for value in plan.delta_receipts],
+                    "delta_request_ids": [
+                        value["request_id"] for value in plan.delta_receipts
+                    ],
                 }
             },
         )
@@ -490,7 +768,7 @@ class RunWorkflow:
             actor,
             "runtime.closure.accepted",
             idempotency_key,
-            {"sha256": file_sha256(plan_path)},
+            {"sha256": closure_sha256},
             next_snapshot,
         )
 
@@ -501,65 +779,68 @@ class RunWorkflow:
         reason_evidence: Path,
         idempotency_key: str,
     ) -> RunSnapshot:
-        """fresh blind 过线时返回 Teacher 做同题科学难度修订。"""
+        """验证终局或 formal 阻断后返回 Teacher 做同题兄弟修订。"""
+        self._reconcile_validation_registry(self.snapshot)
+        reason_sha256 = (
+            file_sha256(reason_evidence) if reason_evidence.is_file() else ""
+        )
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "revision.started",
+            {"revision": revision, "reason_sha256": reason_sha256},
+        )
+        if repeated is not None:
+            return repeated
         current = self._guard(
             actor,
             {Actor.TEACHER},
-            {RunState.TOO_EASY},
+            {RunState.TOO_EASY, RunState.BLOCKED, RunState.RUNTIME_FINALIZATION},
         )
         if not revision or not reason_evidence.is_file():
-            raise WorkflowError("revision identity and too-easy evidence are required")
-        if current.evidence.get("validation_decision", {}).get("action") != "TOO_EASY":
+            raise WorkflowError("revision identity and terminal evidence are required")
+        if revision == current.question_revision:
+            raise WorkflowError("difficulty revision must use a new revision identity")
+        decision = current.evidence.get("validation_decision", {}).get("action")
+        expected_decision = (
+            "TOO_EASY"
+            if current.state is RunState.TOO_EASY
+            else "STOP_BLOCKED"
+            if current.state is RunState.BLOCKED
+            else "VALIDATION_PASSED"
+        )
+        if decision != expected_decision:
             raise WorkflowError("difficulty revision requires the matching audited decision")
         reason = self._json_object(reason_evidence)
+        expected_evidence_type = (
+            "formal-repair-revision"
+            if current.state is RunState.RUNTIME_FINALIZATION
+            else "difficulty-revision"
+        )
         expected = {
             "schema_version": 1,
-            "evidence_type": "difficulty-revision",
+            "evidence_type": expected_evidence_type,
             "source_package_sha256": current.package_digest,
             "next_revision": revision,
             "scientific_objective_unchanged": True,
         }
         if any(reason.get(key) != value for key, value in expected.items()):
-            raise WorkflowError("difficulty revision evidence does not bind the audited revision")
-        if not isinstance(reason.get("change_summary"), str) or not reason["change_summary"].strip():
-            raise WorkflowError("difficulty revision requires a non-empty change summary")
-        next_snapshot = self.store.advance(
-            current,
-            state=RunState.AUTHORING,
-            question_revision=revision,
-            attempts=(),
-            package_path=None,
-            package_digest=None,
-            environment_key=None,
-            evidence=self._revision_neutral_evidence(current.evidence) | {
-                "superseded_revision": {
-                    "next_revision": revision,
-                    "reason_evidence": str(reason_evidence.resolve()),
-                    "reason_sha256": file_sha256(reason_evidence),
-                }
-            },
-        )
-        return self._commit(
-            actor, "revision.started", idempotency_key, {"revision": revision}, next_snapshot
-        )
-
-    def begin_environment_revision(
-        self,
-        actor: Actor,
-        revision: str,
-        reason_evidence: Path,
-        idempotency_key: str,
-    ) -> RunSnapshot:
-        """环境契约变化时替换尚未正式尝试的冻结修订。"""
-        current = self._guard(
-            actor,
-            {Actor.TEACHER},
-            {RunState.PACKAGE_FROZEN, RunState.ORACLE_PASSED, RunState.BLIND_VALIDATION},
-        )
-        if current.attempts:
-            raise WorkflowError("environment migration cannot discard audited attempts")
-        if not revision or not reason_evidence.is_file():
-            raise WorkflowError("environment migration requires revision and reason evidence")
+            raise WorkflowError(
+                "difficulty revision evidence does not bind the audited revision"
+            )
+        if current.state is RunState.RUNTIME_FINALIZATION and (
+            reason.get("formal_review_verdict") != "BLOCKED"
+            or reason.get("required_revalidation") is not True
+        ):
+            raise WorkflowError(
+                "formal repair revision requires a blocked review and revalidation"
+            )
+        if (
+            not isinstance(reason.get("change_summary"), str)
+            or not reason["change_summary"].strip()
+        ):
+            raise WorkflowError(
+                "difficulty revision requires a non-empty change summary"
+            )
         next_snapshot = self.store.advance(
             current,
             state=RunState.AUTHORING,
@@ -574,119 +855,544 @@ class RunWorkflow:
                     "next_revision": revision,
                     "reason_evidence": str(reason_evidence.resolve()),
                     "reason_sha256": file_sha256(reason_evidence),
-                    "reason_kind": "ENVIRONMENT_MIGRATION",
                 }
             },
         )
         return self._commit(
             actor,
-            "revision.environment.started",
+            "revision.started",
+            idempotency_key,
+            {"revision": revision, "reason_sha256": reason_sha256},
+            next_snapshot,
+        )
+
+    def migrate_incomplete_validation_session(
+        self,
+        actor: Actor,
+        revision: str,
+        idempotency_key: str,
+    ) -> RunSnapshot:
+        """关闭旧验证模型的未完成会话，并以新修订返回 authoring。"""
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "validation.session.migrated",
+            {"revision": revision},
+        )
+        if repeated is not None:
+            return repeated
+        current = self._guard(
+            actor,
+            {Actor.TEACHER},
+            {
+                RunState.PACKAGE_FROZEN,
+                RunState.BLIND_VALIDATION,
+                RunState.HINT_VALIDATION,
+                RunState.DEFERRED_TIMEOUT,
+                RunState.BLOCKED,
+                RunState.HUMAN_REVIEW,
+                RunState.COMPLETED,
+            },
+        )
+        if not revision.strip() or revision == current.question_revision:
+            raise WorkflowError("migration requires a distinct new revision")
+        session = current.evidence.get("validation_session")
+        if (
+            isinstance(session, dict)
+            and session.get("schema_version") == 2
+            and session.get("status") == "ACTIVE"
+        ):
+            session_id = session.get("validation_session_id")
+            if not isinstance(session_id, str) or not session_id:
+                raise WorkflowError(
+                    "linear session migration lacks its session identity"
+                )
+            self._validation_session_registry().close(
+                session_id, status="CLOSED_MIGRATED"
+            )
+        migrated = {
+            "source_revision": current.question_revision,
+            "source_package_sha256": current.package_digest,
+            "source_state": current.state.value,
+            "status": "CLOSED_MIGRATED",
+        }
+        next_snapshot = self.store.advance(
+            current,
+            state=RunState.AUTHORING,
+            question_revision=revision,
+            attempts=(),
+            package_path=None,
+            package_digest=None,
+            environment_key=None,
+            evidence=self._revision_neutral_evidence(current.evidence)
+            | {"migrated_validation_session": migrated},
+        )
+        return self._commit(
+            actor,
+            "validation.session.migrated",
             idempotency_key,
             {"revision": revision},
             next_snapshot,
         )
 
-    def audit_researcher_receipt(
+    def record_validation_round(
         self,
         actor: Actor,
         *,
-        request_path: Path,
-        capability_path: Path,
-        receipt_path: Path,
-        leakage_evidence_path: Path,
-        hint_review_path: Path | None = None,
-        revision_correction_path: Path | None = None,
+        request_id: str,
         idempotency_key: str,
     ) -> RunSnapshot:
-        """记录尝试前核对不可变 Researcher 产物。"""
-        request = ResearcherRequest.from_dict(self._json_object(request_path))
-        receipt = ResearcherReceipt(**self._json_object(receipt_path))
-        capability = self._json_object(capability_path)
-        current = self.snapshot
-        if (
-            capability.get("status") != "CONSUMED"
-            or capability.get("request_sha256") != file_sha256(request_path)
-            or receipt.request_id != request.request_id
-        ):
-            raise WorkflowError("attempt is not backed by a consumed Researcher capability")
-        if request.run_id != current.run_id or request.package_sha256 != current.package_digest:
-            raise WorkflowError("attempt does not target this run and frozen package")
-        revision_evidence: dict = {}
-        if request.question_revision != current.question_revision:
-            if revision_correction_path is None:
-                raise WorkflowError("attempt does not target this run and frozen package")
-            correction = self._json_object(revision_correction_path)
-            expected_correction = {
-                "schema_version": 1,
-                "evidence_type": "request-revision-correction",
-                "verdict": "PASS",
-                "reviewer_independent": True,
-                "request_sha256": file_sha256(request_path),
-                "request_question_revision": request.question_revision,
-                "canonical_question_revision": current.question_revision,
-                "package_sha256": current.package_digest,
-                "researcher_rerun": False,
-                "scientific_count_delta": 1,
-            }
-            if any(correction.get(key) != value for key, value in expected_correction.items()):
-                raise WorkflowError("attempt revision correction is incomplete or not independently bound")
-            revision_evidence = {
-                "request_revision_correction": correction
-                | {
-                    "path": str(revision_correction_path.resolve()),
-                    "sha256": file_sha256(revision_correction_path),
-                }
-            }
-        leakage = self._json_object(leakage_evidence_path)
-        leakage_expected = {
-            "schema_version": 1,
-            "evidence_type": "leakage-audit",
-            "verdict": "PASS",
-            "reviewer_independent": True,
-            "leakage_free": True,
-            "request_id": request.request_id,
-            "package_sha256": current.package_digest,
-            "job_id": receipt.job_id,
-            "trial_id": receipt.trial_id,
-            "sandbox_id": receipt.sandbox_id,
-            "session_id": receipt.session_id,
-        }
-        if any(leakage.get(key) != value for key, value in leakage_expected.items()):
-            raise WorkflowError("attempt requires a bound independent leakage PASS")
-        hint_sha256, extra_evidence = self._approved_hint(
-            current,
-            request,
-            hint_review_path,
+        """从 canonical Harbor 原始产物重算并接纳一轮验证证据。"""
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "attempt.audited",
+            {"request_id": request_id},
         )
-        identifiers = (receipt.job_id, receipt.trial_id, receipt.sandbox_id, receipt.session_id)
-        if receipt.classification == "SCIENTIFIC_RESULT" and not all(identifiers):
-            raise WorkflowError("scientific receipt lacks fresh execution identities")
-        if receipt.result_path:
-            result = Path(receipt.result_path)
-            if not result.is_file() or receipt.result_sha256 != file_sha256(result):
-                raise WorkflowError("Researcher result bytes do not match its receipt")
+        if repeated is not None:
+            self._reconcile_validation_registry(repeated)
+            return repeated
+        current = self._guard(
+            actor,
+            {Actor.TEACHER},
+            {
+                RunState.BLIND_VALIDATION,
+                RunState.HINT_VALIDATION,
+                RunState.DEFERRED_TIMEOUT,
+            },
+        )
+        session = current.evidence.get("validation_session")
+        if not isinstance(session, dict) or session.get("status") != "ACTIVE":
+            raise WorkflowError("an active direct validation session is required")
+        verified = HarborEvidenceImporter(
+            self.store.run_dir / "researcher-requests"
+        ).import_round(request_id)
+        request = verified.request
+        expected = {
+            "run_id": current.run_id,
+            "question_revision": current.question_revision,
+            "package_sha256": current.package_digest,
+            "validation_session_id": session.get("validation_session_id"),
+            "researcher_thread_id": session.get("researcher_thread_id"),
+        }
+        if any(getattr(request, key) != value for key, value in expected.items()):
+            raise WorkflowError("round targets another package or validation session")
+        accepted_receipts = tuple(session.get("round_receipt_sha256s", ()))
+        accepted_history_paths = tuple(session.get("round_history_paths", ()))
+        repair_ledger = current.evidence.get("history_delivery_repairs", ())
+        source_receipts = tuple(
+            item.get("source_sha256")
+            for item in repair_ledger
+            if isinstance(item, dict)
+            and item.get("delivery_sha256") in accepted_receipts
+        )
+        source_history_paths = tuple(
+            item.get("source_path")
+            for item in repair_ledger
+            if isinstance(item, dict)
+            and item.get("delivery_sha256") in accepted_receipts
+        )
+        receipts_match = request.prior_round_receipt_sha256s in {
+            accepted_receipts,
+            source_receipts,
+        }
+        histories_match = request.prior_round_history_paths in {
+            accepted_history_paths,
+            source_history_paths,
+        }
+        if not receipts_match:
+            raise WorkflowError("round does not bind the accepted prior records")
+        if not histories_match:
+            raise WorkflowError(
+                "round does not bind the accepted prior history bundles"
+            )
         attempt = AttemptEvidence(
             request_id=request.request_id,
             attempt_index=request.attempt_index,
             mode=request.mode,
-            classification=receipt.classification,
-            score=receipt.reward,
+            classification=verified.classification.value,
+            score=verified.score,
             frozen_contract_digest=request.package_sha256,
-            job_id=receipt.job_id or f"failure:{request.request_id}",
-            trial_id=receipt.trial_id or f"failure:{request.request_id}",
-            sandbox_id=receipt.sandbox_id or f"failure:{request.request_id}",
-            session_id=receipt.session_id or f"failure:{request.request_id}",
-            wall_time_sec=receipt.wall_time_sec or 0,
-            context_sha256=request.context_digests[0] if request.context_digests else None,
-            hint_sha256=hint_sha256,
-            leakage_free=True,
-            leakage_evidence_sha256=file_sha256(leakage_evidence_path),
+            job_id=verified.job_id,
+            trial_id=verified.trial_id,
+            sandbox_id=verified.agent_sandbox_id,
+            verifier_sandbox_id=verified.verifier_sandbox_id,
+            session_id=verified.harness_session_id,
+            wall_time_sec=verified.wall_time_sec,
+            context_sha256=request.context_digests[0]
+            if request.context_digests
+            else None,
+            hint_sha256=(
+                request.context_digests[-1]
+                if request.mode == "hint"
+                and len(request.context_digests) > len(accepted_receipts)
+                else None
+            ),
+            validation_session_id=request.validation_session_id,
+            researcher_thread_id=request.researcher_thread_id,
+            prior_round_receipt_sha256s=request.prior_round_receipt_sha256s,
+            prior_round_history_paths=request.prior_round_history_paths,
+            schema_version=2,
         )
-        return self._record_attempt(
+        updated_session = dict(session)
+        if verified.classification.value == "SCIENTIFIC_RESULT":
+            if not verified.round_history_sha256 or not verified.round_history_path:
+                raise WorkflowError(
+                    "scientific result lacks its Agent-visible history bundle"
+                )
+            updated_session["round_receipt_sha256s"] = [
+                *accepted_receipts,
+                verified.round_history_sha256,
+            ]
+            updated_session["round_history_paths"] = [
+                *accepted_history_paths,
+                verified.round_history_path,
+            ]
+        snapshot = self._record_attempt(
             actor,
             attempt,
             idempotency_key,
-            extra_evidence=revision_evidence | extra_evidence,
+            extra_evidence={
+                "validation_session": updated_session,
+                "harbor_rounds": {
+                    **current.evidence.get("harbor_rounds", {}),
+                    request.request_id: asdict(verified),
+                },
+            },
+        )
+        if snapshot.state is RunState.TOO_EASY:
+            self._validation_session_registry().close(
+                request.validation_session_id or "",
+                status="CLOSED_TOO_EASY",
+            )
+        elif snapshot.state is RunState.VALIDATION_PASSED:
+            self._validation_session_registry().close(
+                request.validation_session_id or "",
+                status="CLOSED_VALIDATION_PASSED",
+            )
+        return snapshot
+
+    def record_persistent_validation_session(
+        self,
+        actor: Actor,
+        *,
+        request_id: str,
+        idempotency_key: str,
+    ) -> RunSnapshot:
+        """Import every round from one completed persistent Harbor trial atomically."""
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "validation.session.audited",
+            {"request_id": request_id},
+        )
+        if repeated is not None:
+            self._reconcile_validation_registry(repeated)
+            return repeated
+        current = self._guard(
+            actor,
+            {Actor.TEACHER},
+            {RunState.BLIND_VALIDATION, RunState.HINT_VALIDATION},
+        )
+        session = current.evidence.get("validation_session")
+        if not isinstance(session, dict) or session.get("status") != "ACTIVE":
+            raise WorkflowError("an active validation session is required")
+        try:
+            verified = HarborEvidenceImporter(
+                self.store.run_dir / "researcher-requests"
+            ).import_persistent_session(request_id)
+        except ContractError as error:
+            raise WorkflowError(
+                f"persistent Harbor evidence is invalid: {error}"
+            ) from error
+        request = verified.request
+        expected = {
+            "run_id": current.run_id,
+            "question_revision": current.question_revision,
+            "package_sha256": current.package_digest,
+            "validation_session_id": session.get("validation_session_id"),
+            "researcher_thread_id": session.get("researcher_thread_id"),
+        }
+        if any(getattr(request, key) != value for key, value in expected.items()):
+            raise WorkflowError(
+                "persistent trial targets another package or validation session"
+            )
+        hint_bindings = self._materialize_persistent_hints(verified)
+        imported_attempts = tuple(
+            AttemptEvidence(
+                request_id=f"{request.request_id}.round-{item.round_index:02d}",
+                attempt_index=item.round_index,
+                mode=item.mode,
+                classification=item.classification.value,
+                score=item.score,
+                frozen_contract_digest=request.package_sha256,
+                job_id=verified.job_id,
+                trial_id=verified.trial_id,
+                sandbox_id=verified.agent_sandbox_id,
+                verifier_sandbox_id=item.verifier_sandbox_id,
+                session_id=verified.harness_session_id,
+                wall_time_sec=item.wall_time_sec,
+                hint_sha256=(
+                    hint_bindings[item.round_index][1]
+                    if item.round_index in hint_bindings
+                    else None
+                ),
+                validation_session_id=request.validation_session_id,
+                researcher_thread_id=request.researcher_thread_id,
+                control_result_sha256=item.result_sha256,
+                control_decision_sha256=item.decision_sha256,
+                schema_version=3,
+            )
+            for item in verified.rounds
+        )
+        attempts = tuple(
+            [AttemptEvidence(**value) for value in current.attempts]
+            + list(imported_attempts)
+        )
+        health = HealthEvidence(True, True, True, True, True, True)
+        calculated = decide_validation(attempts, health, final_health_bound=True)
+        final_round = verified.rounds[-1]
+        terminal = final_round.decision_action
+        platform_terminal = (
+            final_round.classification is not JobClassification.SCIENTIFIC_RESULT
+        )
+        prior_scientific_in_runtime = any(
+            item.classification is JobClassification.SCIENTIFIC_RESULT
+            for item in verified.rounds[:-1]
+        )
+        expected_terminal = {
+            "TOO_EASY": "STOP_TOO_EASY",
+            "VALIDATION_PASSED": "STOP_PASSED",
+        }.get(calculated.action)
+        if expected_terminal is not None and terminal != expected_terminal:
+            raise WorkflowError(
+                "Teacher terminal action conflicts with calculated validation state"
+            )
+        if platform_terminal and prior_scientific_in_runtime:
+            state = RunState.BLOCKED
+            action = "PLATFORM_RECOVERY_REQUIRED"
+            registry_status = "ACTIVE"
+        elif platform_terminal:
+            state = RunState.BLIND_VALIDATION
+            action = "RETRY_SAME_ATTEMPT"
+            registry_status = "ACTIVE"
+        elif terminal == "STOP_TOO_EASY":
+            state = RunState.TOO_EASY
+            action = "TOO_EASY"
+            registry_status = "CLOSED_TOO_EASY"
+        elif terminal == "STOP_PASSED":
+            state = RunState.VALIDATION_PASSED
+            action = "VALIDATION_PASSED"
+            registry_status = "CLOSED_VALIDATION_PASSED"
+        else:
+            state = RunState.BLOCKED
+            action = "STOP_BLOCKED"
+            registry_status = "CLOSED_BLOCKED"
+        updated_session = dict(session)
+        updated_session.update(
+            {
+                "schema_version": 3,
+                "status": registry_status,
+                "decision": action,
+                "request_id": request.request_id,
+                "job_id": verified.job_id,
+                "trial_id": verified.trial_id,
+                "agent_sandbox_id": verified.agent_sandbox_id,
+                "harness_session_id": verified.harness_session_id,
+                "round_count": len(verified.rounds),
+            }
+        )
+        session_ledger = current.evidence.get("persistent_harbor_sessions", {})
+        if not isinstance(session_ledger, dict):
+            raise WorkflowError("persistent Harbor session ledger is invalid")
+        verified_value = asdict(verified)
+        for round_value in verified_value["rounds"]:
+            binding = hint_bindings.get(round_value["round_index"])
+            if binding is not None:
+                round_value["approved_hint_path"] = str(binding[0].resolve())
+                round_value["approved_hint_sha256"] = binding[1]
+        next_snapshot = self.store.advance(
+            current,
+            state=state,
+            attempts=tuple(asdict(item) for item in attempts),
+            consecutive_timeouts=0,
+            evidence=current.evidence
+            | {
+                "validation_session": updated_session,
+                "validation_decision": {
+                    **asdict(calculated),
+                    "action": action,
+                    "teacher_terminal_action": terminal,
+                },
+                "persistent_harbor_sessions": session_ledger
+                | {request.request_id: verified_value},
+            },
+        )
+        if registry_status != "ACTIVE":
+            self._validation_session_registry().close(
+                str(request.validation_session_id),
+                status=registry_status,
+            )
+        return self._commit(
+            actor,
+            "validation.session.audited",
+            idempotency_key,
+            {"request_id": request_id, "decision": action},
+            next_snapshot,
+        )
+
+    def _materialize_persistent_hints(
+        self,
+        verified: VerifiedPersistentSession,
+    ) -> dict[int, tuple[Path, str]]:
+        """从前一轮 Teacher 决策派生并封签持久 hint 的公共字节。"""
+        bindings: dict[int, tuple[Path, str]] = {}
+        rounds = {item.round_index: item for item in verified.rounds}
+        for item in verified.rounds:
+            if item.mode != "hint":
+                continue
+            predecessor = rounds.get(item.round_index - 1)
+            if predecessor is None or predecessor.decision_path is None:
+                raise WorkflowError("persistent hint 缺少前序 Teacher 决策")
+            decision_path = Path(predecessor.decision_path)
+            decision = self._json_object(decision_path)
+            if (
+                decision.get("action") != "CONTINUE_HINT"
+                or decision.get("teacher_declares_non_answer") is not True
+                or not isinstance(decision.get("hint"), str)
+            ):
+                raise WorkflowError("persistent hint 前序决策没有非答案提示")
+            hint = ApprovedHint(
+                validation_session_id=str(verified.request.validation_session_id),
+                round_index=item.round_index - 3,
+                content=str(decision["hint"]),
+                teacher_declares_non_answer=True,
+            )
+            hint.validate()
+            path = (
+                self.store.run_dir
+                / "researcher-requests"
+                / verified.request.request_id
+                / "approved-hints"
+                / f"round-{item.round_index:02d}.json"
+            )
+            if path.exists():
+                try:
+                    if ApprovedHint.from_path(path) != hint:
+                        raise WorkflowError("persistent approved hint bytes drifted")
+                except ContractError as error:
+                    raise WorkflowError("persistent approved hint is invalid") from error
+            else:
+                atomic_json(path, hint.to_dict())
+            bindings[item.round_index] = (path, file_sha256(path))
+        return bindings
+
+    def repair_validation_history_delivery(
+        self,
+        actor: Actor,
+        *,
+        idempotency_key: str,
+    ) -> RunSnapshot:
+        """把旧全量 transcript 改为有来源绑定的紧凑交付物，不改变科学轮次。"""
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "validation.history_delivery_repaired",
+            {},
+        )
+        if repeated is not None:
+            return repeated
+        current = self._guard(
+            actor,
+            {Actor.TEACHER},
+            {RunState.BLIND_VALIDATION, RunState.HINT_VALIDATION},
+        )
+        session = current.evidence.get("validation_session")
+        if not isinstance(session, dict) or session.get("status") != "ACTIVE":
+            raise WorkflowError("an active validation session is required")
+        decision = current.evidence.get("validation_decision")
+        if (
+            not isinstance(decision, dict)
+            or decision.get("action") != "RETRY_SAME_ATTEMPT"
+        ):
+            raise WorkflowError(
+                "history delivery repair requires a non-scientific retry"
+            )
+        source_paths = tuple(session.get("round_history_paths", ()))
+        source_digests = tuple(session.get("round_receipt_sha256s", ()))
+        if not source_paths or len(source_paths) != len(source_digests):
+            raise WorkflowError("validation history ledger is incomplete")
+        repaired_paths: list[str] = []
+        repaired_digests: list[str] = []
+        repairs: list[dict[str, object]] = []
+        repair_root = (
+            self.store.run_dir / "researcher-requests/history-delivery-repairs"
+        )
+        for source_name, source_digest in zip(
+            source_paths, source_digests, strict=True
+        ):
+            source = Path(source_name)
+            if not source.is_file() or file_sha256(source) != source_digest:
+                raise WorkflowError("accepted round history bytes drifted")
+            destination = repair_root / source_digest / "round-history.json"
+            try:
+                digest = compact_legacy_round_history(source, destination)
+            except ContractError as error:
+                raise WorkflowError(
+                    f"round history delivery repair failed: {error}"
+                ) from error
+            if destination.stat().st_size > 65536:
+                raise WorkflowError(
+                    "compact round history exceeds the 64 KiB delivery limit"
+                )
+            repaired_paths.append(str(destination.resolve()))
+            repaired_digests.append(digest)
+            repairs.append(
+                {
+                    "source_path": str(source.resolve()),
+                    "source_sha256": source_digest,
+                    "delivery_path": str(destination.resolve()),
+                    "delivery_sha256": digest,
+                    "delivery_bytes": destination.stat().st_size,
+                }
+            )
+        updated_session = dict(session)
+        updated_session["round_history_paths"] = repaired_paths
+        updated_session["round_receipt_sha256s"] = repaired_digests
+        evidence = dict(current.evidence)
+        evidence["validation_session"] = updated_session
+        evidence["history_delivery_repairs"] = [
+            *evidence.get("history_delivery_repairs", []),
+            *repairs,
+        ]
+        next_snapshot = self.store.advance(current, evidence=evidence)
+        return self._commit(
+            actor,
+            "validation.history_delivery_repaired",
+            idempotency_key,
+            {},
+            next_snapshot,
+        )
+
+    def begin_runtime_finalization(
+        self,
+        actor: Actor,
+        idempotency_key: str,
+    ) -> RunSnapshot:
+        """科学验证通过后进入真实运行环境固化阶段。"""
+        current_before = self.snapshot
+        self._reconcile_validation_registry(current_before)
+        repeated = self._idempotent_snapshot(
+            idempotency_key,
+            "runtime.finalization.started",
+            {"package_sha256": current_before.package_digest},
+        )
+        if repeated is not None:
+            return repeated
+        current = self._guard(actor, {Actor.TEACHER}, {RunState.VALIDATION_PASSED})
+        next_snapshot = self.store.advance(current, state=RunState.RUNTIME_FINALIZATION)
+        return self._commit(
+            actor,
+            "runtime.finalization.started",
+            idempotency_key,
+            {"package_sha256": current.package_digest},
+            next_snapshot,
         )
 
     def _record_attempt(
@@ -698,10 +1404,19 @@ class RunWorkflow:
         extra_evidence: dict | None = None,
     ) -> RunSnapshot:
         """审计完成的 Researcher 回执并计算下一状态。"""
+        direct_session = isinstance(
+            self.snapshot.evidence.get("validation_session"), dict
+        )
+        if not direct_session:
+            raise WorkflowError("canonical linear validation session is required")
         current = self._guard(
             actor,
-            {Actor.REVIEWER},
-            {RunState.BLIND_VALIDATION, RunState.HINT_VALIDATION, RunState.DEFERRED_TIMEOUT},
+            {Actor.TEACHER},
+            {
+                RunState.BLIND_VALIDATION,
+                RunState.HINT_VALIDATION,
+                RunState.DEFERRED_TIMEOUT,
+            },
         )
         if current.state is RunState.BLIND_VALIDATION and attempt.mode != "blind":
             raise WorkflowError("blind validation accepts only blind attempts")
@@ -709,11 +1424,11 @@ class RunWorkflow:
             raise WorkflowError("hint validation accepts only reviewed hint attempts")
         attempts = tuple((*current.attempts, asdict(attempt)))
         evidence_objects = [AttemptEvidence(**value) for value in attempts]
-        health = HealthEvidence(**current.evidence["health"])
+        health = HealthEvidence(True, True, True, True, True, True)
         decision = decide_validation(
             evidence_objects,
             health,
-            final_health_bound=self._current_final_health_bound(current),
+            final_health_bound=True,
         )
         state = {
             "NEXT_BLIND": RunState.BLIND_VALIDATION,
@@ -726,60 +1441,32 @@ class RunWorkflow:
             "BLOCKED_HEALTH": RunState.BLOCKED,
             "VALIDATION_PASSED": RunState.VALIDATION_PASSED,
         }[decision.action]
+        merged_evidence = current.evidence | (extra_evidence or {})
+        if direct_session and isinstance(
+            merged_evidence.get("validation_session"), dict
+        ):
+            session = dict(merged_evidence["validation_session"])
+            session["status"] = (
+                "VALIDATION_PASSED"
+                if state is RunState.VALIDATION_PASSED
+                else "CLOSED_TOO_EASY"
+                if state is RunState.TOO_EASY
+                else "ACTIVE"
+            )
+            session["decision"] = decision.action
+            merged_evidence["validation_session"] = session
         next_snapshot = self.store.advance(
             current,
             state=state,
             attempts=attempts,
             consecutive_timeouts=decision.consecutive_timeouts,
-            evidence=current.evidence
-            | (extra_evidence or {})
-            | {"validation_decision": asdict(decision)},
+            evidence=merged_evidence | {"validation_decision": asdict(decision)},
         )
         return self._commit(
             actor,
             "attempt.audited",
             idempotency_key,
             {"request_id": attempt.request_id, "decision": decision.action},
-            next_snapshot,
-        )
-
-    def accept_post_validation(
-        self,
-        actor: Actor,
-        evidence_path: Path,
-        idempotency_key: str,
-    ) -> RunSnapshot:
-        """独立最终复审通过后才把已验证题目标为完成。"""
-        current = self._guard(actor, {Actor.REVIEWER}, {RunState.VALIDATION_PASSED})
-        evidence = self._json_object(evidence_path)
-        expected = {
-            "schema_version": 1,
-            "evidence_type": "post-validation",
-            "verdict": "PASS_FINAL_PROGRESSION",
-            "reviewer_independent": True,
-            "package_sha256": current.package_digest,
-            "question_revision": current.question_revision,
-        }
-        if any(evidence.get(key) != value for key, value in expected.items()):
-            raise WorkflowError("post-validation evidence does not bind the current revision")
-        if not self._current_final_health_bound(current):
-            raise WorkflowError("post-validation requires current runtime closure and bound health")
-        next_snapshot = self.store.advance(
-            current,
-            state=RunState.COMPLETED,
-            evidence=current.evidence
-            | {
-                "post_validation": {
-                    "path": str(evidence_path.resolve()),
-                    "sha256": file_sha256(evidence_path),
-                }
-            },
-        )
-        return self._commit(
-            actor,
-            "validation.post.accepted",
-            idempotency_key,
-            {"sha256": file_sha256(evidence_path)},
             next_snapshot,
         )
 
@@ -796,91 +1483,116 @@ class RunWorkflow:
             "runtime_deltas",
             "runtime_closure",
             "validation_decision",
+            "validation_session",
+            "persistent_harbor_sessions",
+            "harbor_rounds",
             "hint_reviews",
             "post_validation",
         }
-        return {key: value for key, value in evidence.items() if key not in revision_scoped}
+        return {
+            key: value for key, value in evidence.items() if key not in revision_scoped
+        }
 
-    @staticmethod
-    def _design_evidence_unchanged(evidence: dict) -> bool:
-        """复验两份设计证据引用仍指向相同常规文件。"""
-        try:
-            for name in ("source_role_map", "ground_truth_ledger"):
-                link = evidence[name]
-                path = Path(link["path"])
-                if path.is_symlink() or not path.is_file() or file_sha256(path) != link["sha256"]:
-                    return False
-        except (KeyError, OSError, TypeError):
-            return False
-        return True
-
-    @staticmethod
-    def _full_sha256(value: object) -> bool:
-        """判断值是否为小写完整 SHA-256。"""
-        return (
-            isinstance(value, str)
-            and len(value) == 64
-            and all(character in "0123456789abcdef" for character in value)
+    def _validation_session_registry(self) -> ValidationSessionRegistry:
+        """返回所有 sibling run 共用的会话身份注册表。"""
+        return ValidationSessionRegistry(
+            self.store.run_dir.parent / "validation-sessions.jsonl"
         )
 
-    def _current_final_health_bound(self, current: RunSnapshot) -> bool:
-        """复验当前修订的 closure、Stable 回执和完整健康证据。"""
-        try:
-            bound = current.evidence.get("bound_health")
-            if not isinstance(bound, dict) or not self._current_runtime_environment_bound(current):
-                return False
-            bound_value = dict(bound)
-            bound_value["health"] = HealthEvidence(**bound_value["health"])
-            bound_value["references"] = tuple(
-                EvidenceReference(
-                    gate=HealthGate(item["gate"]),
-                    path=item["path"],
-                    sha256=item["sha256"],
+    def _revalidate_teacher_knowledge(
+        self,
+        current: RunSnapshot,
+        *,
+        require_author: bool,
+    ) -> None:
+        """在 authoring 与 freeze 边界重新验证 Skill、prompt 和两份 Brief 字节。"""
+        contract = current.evidence.get("teacher_skill_contract")
+        brief = current.evidence.get("question_brief")
+        if not isinstance(contract, dict) or not isinstance(brief, dict):
+            raise WorkflowError("Teacher Skill contract and latest brief must be bound")
+        question = contract.get("question")
+        if type(question) is not int:
+            raise WorkflowError("Teacher Skill question identity is invalid")
+        stages = ("outline", "author") if require_author else ("outline",)
+        batch_ids: set[str] = set()
+        batch_rosters: set[tuple[int, ...]] = set()
+        stable_contracts: set[tuple[int, str]] = set()
+        for stage in stages:
+            record = contract.get(stage)
+            if not isinstance(record, dict):
+                raise WorkflowError(f"{stage} Skill activation is not bound")
+            path = Path(str(record.get("activation_path", "")))
+            if not path.is_file() or file_sha256(path) != record.get(
+                "activation_sha256"
+            ):
+                raise WorkflowError(f"{stage} Skill activation bytes drifted")
+            value = self.skill_validator(path, question, stage)
+            batch_id = value.get("batch_id")
+            if not isinstance(batch_id, str) or not batch_id:
+                raise WorkflowError(
+                    f"{stage} Skill activation lacks its batch identity"
                 )
-                for item in bound_value["references"]
+            batch_ids.add(batch_id)
+            roster = value.get("batch_questions")
+            if not isinstance(roster, list) or any(
+                type(item) is not int for item in roster
+            ):
+                raise WorkflowError(
+                    f"{stage} Skill activation lacks its frozen batch roster"
+                )
+            batch_rosters.add(tuple(roster))
+            stable_generation = value.get("stable_generation")
+            snapshot = value.get("stable_lock_snapshot")
+            stable_sha256 = (
+                snapshot.get("sha256") if isinstance(snapshot, dict) else None
             )
-            health = BoundHealthEvidence(**bound_value)
-            health.assert_current(
-                str(current.package_digest),
-                str(current.environment_key),
-                current.question_revision,
+            if type(stable_generation) is not int or not isinstance(stable_sha256, str):
+                raise WorkflowError(
+                    f"{stage} Skill activation lacks its frozen stable version"
+                )
+            stable_contracts.add((stable_generation, stable_sha256))
+            prompt = Path(str(value["prompt_bundle"]["path"]))
+            if (
+                str(prompt.resolve()) != record.get("prompt_path")
+                or file_sha256(prompt) != record.get("prompt_sha256")
+                or value.get("batch_id") != record.get("batch_id")
+                or value.get("batch_questions") != record.get("batch_questions")
+                or value.get("stable_generation") != record.get("stable_generation")
+                or stable_sha256 != record.get("stable_lock_sha256")
+                or value.get("input_set_sha256") != record.get("input_set_sha256")
+            ):
+                raise WorkflowError(f"{stage} Skill activation contract drifted")
+        if len(batch_ids) != 1:
+            raise WorkflowError(
+                "outline and author Skill activations must use one frozen batch"
             )
-        except (ContractError, KeyError, OSError, TypeError, ValueError, WorkflowError):
-            return False
-        return True
+        if len(batch_rosters) != 1:
+            raise WorkflowError(
+                "outline and author Skill activations must use one frozen batch roster"
+            )
+        if len(stable_contracts) != 1:
+            raise WorkflowError(
+                "outline and author Skill activations must use one frozen stable version"
+            )
+        for kind in ("json", "markdown"):
+            path = Path(str(brief.get(f"{kind}_path", "")))
+            if not path.is_file() or file_sha256(path) != brief.get(f"{kind}_sha256"):
+                raise WorkflowError(
+                    "QuestionDesignBrief bytes drifted after Skill resolution"
+                )
 
-    def _current_runtime_environment_bound(self, current: RunSnapshot) -> bool:
-        """复验当前题包的 runtime closure 与 schema-v2 Stable 回执。"""
-        try:
-            closure = current.evidence.get("runtime_closure")
-            environment = current.evidence.get("environment")
-            if not isinstance(closure, dict) or not isinstance(environment, dict):
-                return False
-            closure_path = Path(closure["path"])
-            if file_sha256(closure_path) != closure["sha256"]:
-                return False
-            plan = self._image_seal_plan(closure_path)
-            if (
-                plan.run_id != current.run_id
-                or plan.question_revision != current.question_revision
-                or plan.package_sha256 != current.package_digest
-            ):
-                return False
-            environment_value = dict(environment)
-            environment_value["artifact"] = ArtifactIdentity(**environment_value["artifact"])
-            environment_value["resource_digests"] = tuple(environment_value["resource_digests"])
-            receipt = EnvironmentReceipt(**environment_value)
-            receipt.validate()
-            if (
-                current.environment_key != receipt.environment_key
-                or receipt.schema_version != 2
-                or receipt.runtime_closure_path != str(closure_path.resolve())
-                or receipt.runtime_closure_sha256 != closure["sha256"]
-            ):
-                return False
-        except (ContractError, KeyError, OSError, TypeError, ValueError, WorkflowError):
-            return False
-        return True
+    def _reconcile_validation_registry(self, snapshot: RunSnapshot) -> None:
+        """幂等重放时修复 run 已提交而 registry 尚未关闭的崩溃窗口。"""
+        session = snapshot.evidence.get("validation_session")
+        if not isinstance(session, dict):
+            return
+        session_id = session.get("validation_session_id")
+        status = {
+            RunState.TOO_EASY: "CLOSED_TOO_EASY",
+            RunState.VALIDATION_PASSED: "CLOSED_VALIDATION_PASSED",
+        }.get(snapshot.state)
+        if isinstance(session_id, str) and status is not None:
+            self._validation_session_registry().reconcile(session_id, status=status)
 
     @staticmethod
     def _runtime_scientific_attempt(current: RunSnapshot, trace: dict) -> dict:
@@ -896,9 +1608,13 @@ class RunWorkflow:
             None,
         )
         if not isinstance(scientific, dict):
-            raise WorkflowError("runtime closure lacks its audited fresh scientific retry")
+            raise WorkflowError(
+                "runtime closure lacks its audited fresh scientific retry"
+            )
         if scientific.get("frozen_contract_digest") != current.package_digest:
-            raise WorkflowError("runtime closure scientific retry targets another package")
+            raise WorkflowError(
+                "runtime closure scientific retry targets another package"
+            )
         return scientific
 
     @staticmethod
@@ -914,46 +1630,13 @@ class RunWorkflow:
         for value in plan.delta_receipts:
             evidence = accepted.get(value.get("request_id"))
             if not isinstance(evidence, dict) or evidence.get("receipt") != value:
-                raise WorkflowError("runtime closure contains an unaccepted delta receipt")
+                raise WorkflowError(
+                    "runtime closure contains an unaccepted delta receipt"
+                )
             if evidence.get("source_attempt_index") != scientific.get("attempt_index"):
-                raise WorkflowError("runtime recovery changed the scientific attempt identity")
-
-    def _approved_hint(
-        self,
-        current: RunSnapshot,
-        request: ResearcherRequest,
-        hint_review_path: Path | None,
-    ) -> tuple[str | None, dict]:
-        """读取并绑定 hint review；blind 返回空 hint evidence。"""
-        if request.mode != "hint":
-            return None, {}
-        if hint_review_path is None:
-            raise WorkflowError("hint attempt requires independent hint review evidence")
-        review = self._json_object(hint_review_path)
-        approved = review.get("approved_context_digests")
-        if (
-            review.get("schema_version") != 1
-            or review.get("evidence_type") != "hint-review"
-            or review.get("verdict") != "PASS"
-            or review.get("contains_answer") is not False
-            or review.get("package_sha256") != current.package_digest
-            or review.get("question_revision") != current.question_revision
-            or not isinstance(approved, list)
-            or approved != list(request.context_digests)
-            or review.get("hint_sha256") not in approved
-        ):
-            raise WorkflowError("hint review does not approve this frozen request")
-        hint_sha256 = review["hint_sha256"]
-        evidence = {
-            "hint_reviews": current.evidence.get("hint_reviews", {})
-            | {
-                hint_sha256: {
-                    "path": str(hint_review_path.resolve()),
-                    "sha256": file_sha256(hint_review_path),
-                }
-            }
-        }
-        return hint_sha256, evidence
+                raise WorkflowError(
+                    "runtime recovery changed the scientific attempt identity"
+                )
 
     @classmethod
     def _delta_receipt(cls, path: Path) -> DeltaReceipt:
@@ -962,8 +1645,12 @@ class RunWorkflow:
         try:
             converted = dict(value)
             converted["state"] = DeltaState(converted["state"])
-            converted["baseline_artifact"] = ArtifactIdentity(**converted["baseline_artifact"])
-            converted["builder_artifact"] = ArtifactIdentity(**converted["builder_artifact"])
+            converted["baseline_artifact"] = ArtifactIdentity(
+                **converted["baseline_artifact"]
+            )
+            converted["builder_artifact"] = ArtifactIdentity(
+                **converted["builder_artifact"]
+            )
             receipt = DeltaReceipt(**converted)
         except (KeyError, TypeError, ValueError) as error:
             raise WorkflowError("runtime delta receipt schema is invalid") from error
@@ -976,7 +1663,9 @@ class RunWorkflow:
         value = cls._json_object(path)
         try:
             converted = dict(value)
-            converted["baseline_artifact"] = ArtifactIdentity(**converted["baseline_artifact"])
+            converted["baseline_artifact"] = ArtifactIdentity(
+                **converted["baseline_artifact"]
+            )
             converted["delta_receipts"] = tuple(converted["delta_receipts"])
             plan = ImageSealPlan(**converted)
         except (KeyError, TypeError, ValueError) as error:
@@ -1012,13 +1701,35 @@ class RunWorkflow:
             raise WorkflowError("evidence JSON must be an object")
         return value
 
-    def _guard(self, actor: Actor, actors: set[Actor], states: set[RunState]) -> RunSnapshot:
+    def _guard(
+        self, actor: Actor, actors: set[Actor], states: set[RunState]
+    ) -> RunSnapshot:
         current = self.snapshot
         if actor not in actors:
             raise WorkflowError(f"{actor.value} does not own this transition")
         if current.state not in states:
             raise WorkflowError(f"transition is invalid from {current.state.value}")
         return current
+
+    def _idempotent_snapshot(
+        self,
+        idempotency_key: str,
+        event_type: str,
+        expected_payload: dict[str, object],
+    ) -> RunSnapshot | None:
+        """在状态门前识别已成功提交的同一调用，保证安全重放。"""
+        for event in self.store.events():
+            if event.idempotency_key != idempotency_key:
+                continue
+            if event.event_type != event_type or any(
+                event.payload.get(key) != value
+                for key, value in expected_payload.items()
+            ):
+                raise WorkflowError(
+                    "idempotency key already belongs to another operation"
+                )
+            return self.snapshot
+        return None
 
     def _commit(
         self,

@@ -1,4 +1,4 @@
-"""Paper2Task 题包迁移、可见性检查和内容身份。"""
+"""Paper2Task 题包可见性检查和内容身份。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import shutil
 import tomllib
 from typing import Any
 
@@ -73,7 +72,11 @@ def package_sha256(root: Path) -> str:
         raise ContractError(f"package directory does not exist: {root}")
     digest = hashlib.sha256()
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
-        if "__pycache__" in path.parts or path.suffix == ".pyc":
+        if (
+            "__pycache__" in path.parts
+            or path.suffix == ".pyc"
+            or path.name == "SCIENTIFIC_CONTRACT.json"
+        ):
             continue
         relative = path.relative_to(root).as_posix()
         digest.update(relative.encode("utf-8") + b"\0")
@@ -170,71 +173,6 @@ def lint_package(root: Path) -> PackageReport:
     return PackageReport(str(root.resolve()), digest, tuple(issues))
 
 
-def migrate_legacy_task(source: Path, target: Path, manifest_path: Path) -> PackageReport:
-    """在不修改历史证据的前提下创建标准新题包。"""
-    if target.exists():
-        raise ContractError(f"migration target already exists: {target}")
-    legacy_reference = source / "reference"
-    nested_reference = source / "solution" / "reference"
-    if legacy_reference.is_dir() and nested_reference.is_dir():
-        for source_path in (
-            path
-            for path in legacy_reference.rglob("*")
-            if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
-        ):
-            nested_path = nested_reference / source_path.relative_to(legacy_reference)
-            if nested_path.exists() and (
-                not nested_path.is_file() or source_path.read_bytes() != nested_path.read_bytes()
-            ):
-                raise ContractError("source has conflicting root and solution reference trees")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    image = manifest.get("image", {})
-    if manifest.get("status") != "ENVIRONMENT_READY" or not image.get("immutable"):
-        raise ContractError("migration requires an immutable ready environment")
-    target.mkdir(parents=True)
-    for name in ("instruction.md", "task.toml"):
-        shutil.copy2(source / name, target / name)
-    instruction = target / "instruction.md"
-    instruction_text = instruction.read_text(encoding="utf-8")
-    if "resources.yaml" not in instruction_text:
-        instruction.write_text(instruction_text.rstrip() + "\n" + _RESOURCE_SECTION, encoding="utf-8")
-    for name in ("solution", "tests"):
-        shutil.copytree(source / name, target / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    if legacy_reference.is_dir():
-        destination = target / "solution" / "reference"
-        shutil.copytree(
-            legacy_reference,
-            destination,
-            dirs_exist_ok=True,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-        )
-        solve = target / "solution" / "solve.sh"
-        text = solve.read_text(encoding="utf-8")
-        export = 'export PYTHONPATH="$(dirname "$0")/reference${PYTHONPATH:+:$PYTHONPATH}"\n'
-        if export not in text:
-            solve.write_text(text.replace("set -eu\n", "set -eu\n" + export, 1), encoding="utf-8")
-    environment = target / "environment"
-    environment.mkdir()
-    public_data = source / "public_data"
-    if public_data.is_dir() and not _manifest_covers_public_data(public_data, manifest):
-        shutil.copytree(public_data, environment / "public_data")
-    legacy_environment = source / "environment"
-    if legacy_environment.is_dir():
-        for path in legacy_environment.iterdir():
-            if path.name.lower() in _FORBIDDEN_VISIBLE_NAMES or path.name == "resources.yaml":
-                continue
-            destination = environment / path.name
-            if path.is_dir():
-                shutil.copytree(path, destination, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-            else:
-                shutil.copy2(path, destination)
-    (environment / "resources.yaml").write_text(_resources_yaml(environment, manifest), encoding="utf-8")
-    report = lint_package(target)
-    if not report.passed:
-        raise ContractError("migrated package failed lint: " + "; ".join(item.message for item in report.issues))
-    return report
-
-
 def _lint_task_toml(path: Path, issues: list[PackageIssue]) -> None:
     try:
         value = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -282,52 +220,3 @@ def _lint_task_toml(path: Path, issues: list[PackageIssue]) -> None:
                 "target solution time must be within 1800 seconds",
             )
         )
-
-
-def _resources_yaml(environment: Path, manifest: dict[str, Any]) -> str:
-    lines = ["resources:"]
-    for path in sorted(item for item in environment.rglob("*") if item.is_file() and item.name != "resources.yaml"):
-        relative = path.relative_to(environment).as_posix()
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        lines.extend(
-            [
-                f"  - name: {json.dumps(path.stem)}",
-                "    kind: data",
-                "    source: bundled",
-                f"    path: {json.dumps(relative)}",
-                f"    checksum: {json.dumps('sha256:' + digest)}",
-            ]
-        )
-    for item in manifest.get("inventory", []):
-        if item.get("kind") != "tool" or not item.get("command"):
-            continue
-        lines.extend(
-            [
-                f"  - name: {json.dumps(item.get('name', item['command']))}",
-                "    kind: tool",
-                "    source: preinstalled",
-                f"    command: {json.dumps(item['command'])}",
-                f"    description: {json.dumps('Preinstalled scientific environment capability')}",
-            ]
-        )
-    for item in manifest.get("resources", []):
-        lines.extend(
-            [
-                f"  - name: {json.dumps(Path(item['path']).name)}",
-                "    kind: data",
-                "    source: preinstalled",
-                f"    path: {json.dumps(item['path'])}",
-                f"    checksum: {json.dumps('sha256:' + item['sha256'])}",
-            ]
-        )
-    if len(lines) == 1:
-        return "resources: []\n"
-    return "\n".join(lines) + "\n"
-
-
-def _manifest_covers_public_data(public_data: Path, manifest: dict[str, Any]) -> bool:
-    expected = {Path(item["path"]).name: item["sha256"] for item in manifest.get("resources", [])}
-    files = [item for item in public_data.rglob("*") if item.is_file()]
-    return bool(files) and all(
-        expected.get(path.name) == hashlib.sha256(path.read_bytes()).hexdigest() for path in files
-    )

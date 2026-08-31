@@ -36,6 +36,32 @@ class MethodSelectionModule:
         if not source_ids <= set(brief.evidence_roles):
             raise ContractError("every method-selection source requires an evidence role")
 
+    def validate_background_evidence(self, brief: QuestionDesignBrief) -> None:
+        """要求新题用可排除的合理干扰形成证据选择，而不是噪声。"""
+        self.validate_brief(brief)
+        roles = {item.role for item in brief.background_evidence}
+        required_roles = {"load_bearing", "context_only", "conditional_distractor"}
+        if not required_roles <= roles:
+            raise ContractError(
+                "method-selection background evidence requires load-bearing, "
+                "context-only, and conditional-distractor roles"
+            )
+        distractors = tuple(
+            item
+            for item in brief.background_evidence
+            if item.role == "conditional_distractor"
+        )
+        if len(distractors) < 2:
+            raise ContractError(
+                "method-selection requires at least two conditional distractors"
+            )
+        method_space = set(brief.method_space)
+        for item in distractors:
+            if not set(item.linked_methods) <= method_space:
+                raise ContractError(
+                    "conditional distractor links an unknown method choice"
+                )
+
 
 class QuestionTypeRegistry:
     """根据大纲中的稳定题型标识选择对应模块。"""

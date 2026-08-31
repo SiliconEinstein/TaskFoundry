@@ -9,12 +9,13 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import runpy
 import tempfile
 import uuid
 
 from .model import ContractError, RunState
+from .publication import finalize_published_family, published_family_path
 from .scheduler_state import (
+    CAMPAIGN_MIN_SLOT_LIMIT,
     CAMPAIGN_SLOT_LIMIT,
     DEFAULT_LEASE_TTL_SEC,
     DispatchState,
@@ -28,23 +29,17 @@ from .scheduler_state import (
     question_number,
     snapshot_from_dict,
 )
+from .skillbank import reconcile_skill_batch_if_ready
 from .store import RunStore
 
 
-# 旧调用方仍可导入这个名称，但 Q1--Q32 campaign 已固定为三槽。
-DEFAULT_TEACHER_MAX_ACTIVE = CAMPAIGN_SLOT_LIMIT
+# 旧调用方仍可导入这些名称；campaign 可在一至五槽间切换。
+DEFAULT_TEACHER_MAX_ACTIVE = 1
 MAX_TEACHER_MAX_ACTIVE = CAMPAIGN_SLOT_LIMIT
-PublicationValidator = Callable[[int, Path], None]
-
-
-def _default_validate_published_family(question: int, family: Path) -> None:
-    """调用发布与全仓检查共用的题族验证器。"""
-    validator_path = Path(__file__).resolve().parents[2] / "scripts" / "question_family_validation.py"
-    if not validator_path.is_file():
-        raise ContractError("question family publication validator is unavailable")
+def _default_finalize_published_family(question: int, family: Path, run: object) -> Path:
+    """调用唯一的线性验证题族发布事务。"""
     try:
-        validator = runpy.run_path(str(validator_path))["validate_family"]
-        validator(question, family, staging_required=False)
+        return finalize_published_family(question, family, run)  # type: ignore[arg-type]
     except Exception as error:
         raise ContractError(f"published question family validation failed: {error}") from error
 
@@ -68,7 +63,6 @@ class QuestionScheduler:
         clock: Callable[[], datetime] | None = None,
         token_factory: Callable[[], str] | None = None,
         lease_ttl_sec: int = DEFAULT_LEASE_TTL_SEC,
-        publication_validator: PublicationValidator | None = None,
     ) -> None:
         if not 30 <= lease_ttl_sec <= 86400:
             raise ContractError("lease TTL must be between 30 and 86400 seconds")
@@ -79,7 +73,6 @@ class QuestionScheduler:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.token_factory = token_factory or (lambda: uuid.uuid4().hex)
         self.lease_ttl_sec = lease_ttl_sec
-        self.publication_validator = publication_validator or _default_validate_published_family
 
     def snapshot(self) -> SchedulerSnapshot:
         """读取 v2；缺失时返回全局看板，v1 时只做内存迁移。"""
@@ -104,7 +97,7 @@ class QuestionScheduler:
         teacher_thread_id: str | None = None,
         teacher_prompt_path: Path | None = None,
     ) -> ScheduleResult:
-        """配置一道 backlog 题并按三槽约束立即尝试激活。"""
+        """配置一道 backlog 题并按当前槽位约束立即尝试激活。"""
         number = question_number(question_id)
         if number <= 2:
             raise ContractError("q1 and q2 are grandfathered and cannot be enqueued")
@@ -136,17 +129,31 @@ class QuestionScheduler:
             return result
 
     def tick(self) -> ScheduleResult:
-        """过期陈旧租约、同步终态并自动补足三个槽。"""
+        """过期陈旧租约、同步终态并自动补足当前槽位。"""
         with self._locked():
             result = self._sync_and_fill(self.snapshot(), self._now())
             self._write(result.snapshot)
             return result
 
     def configure(self, *, max_active: int) -> ScheduleResult:
-        """兼容旧 CLI；campaign 并发只能确认成三槽。"""
-        if max_active != CAMPAIGN_SLOT_LIMIT:
-            raise ContractError("Q1-Q32 campaign Teacher limit is fixed at 3")
-        return ScheduleResult(self.snapshot(), (), ())
+        """把 campaign Teacher 并发设置为一至五个槽位。"""
+        if not CAMPAIGN_MIN_SLOT_LIMIT <= max_active <= CAMPAIGN_SLOT_LIMIT:
+            raise ContractError("Q1-Q32 campaign Teacher limit must be between 1 and 5")
+        with self._locked():
+            current = self.snapshot()
+            now = self._now()
+            active = tuple(
+                item
+                for item in current.questions
+                if item.state is QueueState.LEASED
+                and item.lease is not None
+                and parse_timestamp(item.lease.expires_at, "expires_at") > now
+            )
+            if len(active) > max_active:
+                raise ContractError("cannot lower Teacher limit below active non-expired leases")
+            result = self._sync_and_fill(replace(current, max_active=max_active), now)
+            self._write(result.snapshot)
+            return result
 
     def heartbeat(
         self,
@@ -314,7 +321,6 @@ class QuestionScheduler:
     def bind_published_family(
         self,
         question_id: str,
-        family: Path,
         *,
         owner_id: str,
         lease_id: str,
@@ -324,7 +330,7 @@ class QuestionScheduler:
         number = question_number(question_id)
         if number <= 2:
             raise ContractError("q1 and q2 publication is grandfathered")
-        resolved_family = family.resolve()
+        resolved_family = published_family_path(number).resolve()
         with self._locked():
             current = self.snapshot()
             item = self._item(current, question_id)
@@ -335,7 +341,10 @@ class QuestionScheduler:
             run = RunStore(Path(item.run_dir)).read_snapshot()
             if run is None or run.state is not RunState.COMPLETED:
                 raise ContractError("published family can only bind to a completed run")
-            self.publication_validator(number, resolved_family)
+            sealed_trace = _default_finalize_published_family(number, resolved_family, run)
+            if not sealed_trace.is_dir() or sealed_trace.is_symlink():
+                raise ContractError("published family final trace was not sealed")
+            self._reconcile_batch_at_completion(current, item, run)
             completed = replace(
                 item,
                 state=QueueState.COMPLETED,
@@ -352,6 +361,32 @@ class QuestionScheduler:
             result = replace(result, released=(question_id, *result.released))
             self._write(result.snapshot)
             return result
+
+    @staticmethod
+    def _reconcile_batch_at_completion(
+        scheduler: SchedulerSnapshot,
+        completing_item: ScheduledQuestion,
+        completing_run: object,
+    ) -> None:
+        """同一冻结 batch 的最后一道题发布时自动执行 Skill Bank reconcile。"""
+        batch_contract = _run_batch_contract(completing_run)
+        if batch_contract is None:
+            raise ContractError("completed run lacks one frozen Teacher Skill batch")
+        batch_id, expected_questions, _stable_generation, _stable_lock_sha256 = batch_contract
+        scheduled_by_position = {item.position: item for item in scheduler.questions}
+        if any(question not in scheduled_by_position for question in expected_questions):
+            raise ContractError("frozen Teacher Skill batch is not fully enrolled in scheduler")
+        for item in scheduler.questions:
+            if item.position not in expected_questions:
+                continue
+            if not item.run_dir:
+                raise ContractError("frozen Teacher Skill batch member has no run directory")
+            run = RunStore(Path(item.run_dir)).read_snapshot()
+            if run is None or _run_batch_contract(run) != batch_contract:
+                raise ContractError("scheduler run does not bind the frozen Teacher Skill batch roster")
+            if item.question_id != completing_item.question_id and item.state is not QueueState.COMPLETED:
+                return
+        reconcile_skill_batch_if_ready(batch_id, expected_questions)
 
     def _sync_and_fill(self, current: SchedulerSnapshot, now: datetime) -> ScheduleResult:
         released: list[str] = []
@@ -373,7 +408,7 @@ class QuestionScheduler:
         owners = {item.lease.owner_id for item in questions if item.lease}
         activated: list[str] = []
         for index, item in enumerate(questions):
-            if occupied >= CAMPAIGN_SLOT_LIMIT:
+            if occupied >= current.max_active:
                 break
             if not self._eligible(item) or item.teacher_thread_id in owners:
                 continue
@@ -556,3 +591,36 @@ class _FileLock:
         assert self.stream is not None
         fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
         self.stream.close()
+
+
+def _run_batch_contract(run: object) -> tuple[str, tuple[int, ...], int, str] | None:
+    evidence = getattr(run, "evidence", None)
+    contract = evidence.get("teacher_skill_contract") if isinstance(evidence, dict) else None
+    if not isinstance(contract, dict):
+        return None
+    outline = contract.get("outline")
+    author = contract.get("author")
+    if not isinstance(outline, dict) or not isinstance(author, dict):
+        return None
+    outline_batch = outline.get("batch_id")
+    author_batch = author.get("batch_id")
+    outline_questions = outline.get("batch_questions")
+    author_questions = author.get("batch_questions")
+    outline_generation = outline.get("stable_generation")
+    author_generation = author.get("stable_generation")
+    outline_lock = outline.get("stable_lock_sha256")
+    author_lock = author.get("stable_lock_sha256")
+    if (
+        not isinstance(outline_batch, str)
+        or outline_batch != author_batch
+        or not isinstance(outline_questions, list)
+        or outline_questions != author_questions
+        or not outline_questions
+        or any(type(item) is not int for item in outline_questions)
+        or type(outline_generation) is not int
+        or outline_generation != author_generation
+        or not isinstance(outline_lock, str)
+        or outline_lock != author_lock
+    ):
+        return None
+    return outline_batch, tuple(outline_questions), outline_generation, outline_lock

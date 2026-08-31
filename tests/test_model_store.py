@@ -6,6 +6,7 @@ import pytest
 
 from taskfoundry.model import (
     Actor,
+    BackgroundEvidence,
     ContractError,
     QuestionDesignBrief,
     RunState,
@@ -42,6 +43,79 @@ def test_brief_validates_and_serializes() -> None:
     assert value["schema_version"] == 1
     assert value["source_questions"][0]["source_id"] == "q1"
     assert QuestionDesignBrief.from_dict(value) == valid_brief()
+
+
+def test_brief_round_trips_difficulty_progression_and_ground_truth_plan() -> None:
+    value = valid_brief().to_dict() | {
+        "difficulty_progression": {
+            "high": "No decomposition hint.",
+            "medium": "Separate simulation from selection.",
+            "low": "Provide a non-answer pseudocode skeleton.",
+        },
+        "ground_truth_plan": {
+            "primary": "Versioned producer.",
+            "cross_check": "Independent recomputation.",
+            "reference_type": "derived_reference",
+            "tolerance_basis": "Binary64 round-trip experiment.",
+        },
+    }
+
+    brief = QuestionDesignBrief.from_dict(value)
+
+    assert brief.to_dict()["difficulty_progression"]["medium"] == (
+        "Separate simulation from selection."
+    )
+    assert brief.to_dict()["ground_truth_plan"]["cross_check"] == (
+        "Independent recomputation."
+    )
+
+
+def test_brief_round_trips_background_evidence() -> None:
+    value = valid_brief().to_dict() | {
+        "background_evidence": [
+            {
+                "evidence_id": "e1",
+                "statement": "Method one is stable under bounded contamination.",
+                "role": "conditional_distractor",
+                "applicable_conditions": "Contamination is sparse.",
+                "decision_effect": "Exclude it when contamination is persistent.",
+                "linked_methods": ["m1"],
+                "public_clues": ["The public series shows persistent contamination."],
+            }
+        ]
+    }
+
+    brief = QuestionDesignBrief.from_dict(value)
+
+    assert brief.background_evidence == (
+        BackgroundEvidence(
+            "e1",
+            "Method one is stable under bounded contamination.",
+            "conditional_distractor",
+            "Contamination is sparse.",
+            "Exclude it when contamination is persistent.",
+            ("m1",),
+            ("The public series shows persistent contamination.",),
+        ),
+    )
+
+
+def test_conditional_distractor_requires_public_disambiguation() -> None:
+    values = valid_brief().__dict__ | {
+        "background_evidence": (
+            BackgroundEvidence(
+                "e1",
+                "A plausible route.",
+                "conditional_distractor",
+                "An alternate regime.",
+                "Reject it for the current regime.",
+                ("m1",),
+                (),
+            ),
+        )
+    }
+    with pytest.raises(ContractError, match="public clues"):
+        QuestionDesignBrief(**values).validate()
 
 
 def test_brief_rejects_solution_target_over_half_hour() -> None:

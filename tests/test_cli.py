@@ -3,21 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import taskfoundry.scheduler as scheduler_module
 
 from taskfoundry.codex_agent import DispatchReceipt
 from taskfoundry.cli import main
-from taskfoundry.package import package_sha256
-from taskfoundry.researcher import ResearcherReceipt
+from taskfoundry.researcher import IssuedHandoff, ResearcherReceipt
 from taskfoundry.labwright import ArtifactIdentity, EnvironmentDeltaRequest, FileLabwrightRegistry
 from taskfoundry.labwright_runtime import artifact_identity_sha256
-from taskfoundry.health import BoundHealthEvidence, HealthGate
 from taskfoundry.model import Actor, RunState
 from taskfoundry.store import RunStore
-from taskfoundry.validation import HealthEvidence
-from taskfoundry.workflow import RunWorkflow
+from taskfoundry.workflow import RunWorkflow, WorkflowError
 
 
 def make_package(root):
@@ -32,56 +30,10 @@ def make_package(root):
     (root / "solution").mkdir()
     (root / "solution/solve.sh").write_text("#!/bin/sh\ntrue\n")
     (root / "tests").mkdir()
-    (root / "tests/test.sh").write_text("#!/bin/sh\necho 1 > /logs/verifier/reward.txt\n")
+    (root / "tests/test.sh").write_text(
+        '#!/bin/sh\n[ "$1" = "--probe" ] && exit 0\necho 1 > /logs/verifier/reward.txt\n'
+    )
     return root
-
-
-def design_links(tmp_path: Path) -> dict[str, dict[str, str]]:
-    """为只测试 CLI 幂等性的裸状态生成稳定设计证据引用。"""
-    result: dict[str, dict[str, str]] = {}
-    for name in ("source_role_map", "ground_truth_ledger"):
-        path = tmp_path / f"{name}.json"
-        path.write_text("{}")
-        result[name] = {
-            "path": str(path.resolve()),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        }
-    return result
-
-
-def write_design_evidence(brief: Path, tmp_path: Path, revision: str = "r1") -> tuple[Path, Path]:
-    """生成可由 attach-design-evidence 命令接纳的两份证据。"""
-    value = json.loads(brief.read_text())
-    digest = hashlib.sha256(brief.read_bytes()).hexdigest()
-    source_ids = [item["source_id"] for item in value["source_questions"]]
-    role_map = tmp_path / "source-role-map.json"
-    role_map.write_text(json.dumps({
-        "schema_version": 1,
-        "evidence_type": "source-role-map",
-        "question_revision": revision,
-        "brief_sha256": digest,
-        "source_ids": source_ids,
-        "roles": value["evidence_roles"],
-        "immutable_source_sha256s": {
-            source_id: hashlib.sha256(source_id.encode()).hexdigest()
-            for source_id in source_ids
-        },
-        "license_review_pass": True,
-    }))
-    ledger = tmp_path / "ground-truth-ledger.json"
-    ledger.write_text(json.dumps({
-        "schema_version": 1,
-        "evidence_type": "ground-truth-ledger",
-        "question_revision": revision,
-        "brief_sha256": digest,
-        "scored_quantities": ["prediction", "method_selection"],
-        "producer_sha256": "1" * 64,
-        "independent_crosscheck_sha256": "2" * 64,
-        "scoring_contract_sha256": "3" * 64,
-        "derived_reference": True,
-        "crosscheck_pass": True,
-    }))
-    return role_map, ledger
 
 
 def test_status_prints_snapshot(tmp_path, capsys) -> None:
@@ -94,253 +46,95 @@ def test_status_prints_snapshot(tmp_path, capsys) -> None:
     assert json.loads(capsys.readouterr().out)["state"] == "DESIGNING"
 
 
-def test_cli_can_prepare_first_blind_without_stable_environment(tmp_path, capsys) -> None:
-    run = tmp_path / "run"
+def test_cli_direct_validation_cannot_skip_teacher_skill_contract(tmp_path, capsys) -> None:
+    run = tmp_path / "direct-run"
     store = RunStore(run)
-    store.initialize("run-1")
-    flow = RunWorkflow(store)
-    brief = tmp_path / "brief.json"
-    brief.write_text(json.dumps({
-        "brief_id": "brief-1",
-        "question_type": "method-selection",
-        "title": "方法选择",
-        "scientific_goal": "选择可迁移方法",
-        "research_object": "隐藏工况",
-        "source_questions": [
-            {"source_id": f"q{i}", "paper_id": f"p{i}", "research_goal": "目标", "method": f"m{i}", "transferred_role": "候选"}
-            for i in range(1, 4)
+    store.initialize("direct-run-1")
+    current = store.read_snapshot()
+    assert current is not None
+    store.commit(
+        actor=Actor.TEACHER,
+        event_type="test.authoring",
+        idempotency_key="test-authoring",
+        payload={},
+        snapshot=store.advance(current, state=RunState.AUTHORING),
+    )
+    task = make_package(tmp_path / "direct-task")
+
+    with pytest.raises(WorkflowError, match="Skill contract"):
+        main([
+            "freeze-and-start-validation",
+            str(run),
+            str(task),
+            "--validation-session-id",
+            "validation-session-1",
+            "--researcher-thread-id",
+            "researcher-thread-1",
+        ])
+
+
+def test_current_workflow_cli_adapters_route_without_legacy_gates(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    RunStore(tmp_path / "run").initialize("q3")
+    snapshot = SimpleNamespace(to_dict=lambda: {"state": "OK"})
+    for name in (
+        "begin_authoring",
+        "accept_teacher_skill_activation",
+        "attach_brief",
+        "record_validation_round",
+        "begin_revision",
+        "accept_runtime_delta",
+        "migrate_incomplete_validation_session",
+        "accept_runtime_closure",
+        "bind_runtime_environment",
+        "begin_runtime_finalization",
+    ):
+        monkeypatch.setattr(RunWorkflow, name, lambda self, *args, **kwargs: snapshot)
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text("{}")
+    activation = tmp_path / "activation.json"
+    activation.write_text(json.dumps({"prompt_bundle": {"path": "/prompt"}}))
+    brief_json = tmp_path / "QuestionDesignBrief.json"
+    brief_markdown = tmp_path / "QuestionDesignBrief.md"
+    brief_json.write_text("{}")
+    brief_markdown.write_text("# Brief")
+    monkeypatch.setattr(
+        "taskfoundry.cli.resolve_teacher_activation", lambda *args, **kwargs: activation
+    )
+    monkeypatch.setattr(
+        "taskfoundry.cli.validate_latest_brief",
+        lambda question: (brief_json, brief_markdown),
+    )
+    monkeypatch.setattr("taskfoundry.cli.record_skill_attribution", lambda *args: artifact)
+    monkeypatch.setattr("taskfoundry.cli.reconcile_skill_batch", lambda *args: {"ok": True})
+    monkeypatch.setattr("taskfoundry.cli.evaluate_skill_candidate", lambda *args: {"ok": True})
+    monkeypatch.setattr("taskfoundry.cli._environment_receipt", lambda path: object())
+
+    commands = (
+        ["begin-authoring", str(tmp_path / "run")],
+        ["bind-teacher-skill", str(tmp_path / "run"), "3", "outline", str(artifact)],
+        ["attach-question-brief", str(tmp_path / "run"), str(artifact)],
+        [
+            "resolve-teacher-skill", "3", "outline", "attempt",
+            "--batch-id", "batch", "--batch-question", "3",
+            "--task-input", str(artifact),
         ],
-        "method_space": ["m1", "m2", "m3"],
-        "evidence_roles": {"q1": "候选", "q2": "候选", "q3": "候选"},
-        "public_inputs": ["input.csv"],
-        "required_outputs": ["output.csv"],
-        "hidden_evaluation_axes": ["迁移"],
-        "environment_capabilities": ["python"],
-        "difficulty_hypothesis": "需要比较方法",
-        "solvability_argument": "公开数据充分",
-    }))
-    policies = tmp_path / "policies.json"
-    policies.write_text("{}")
-    flow.attach_brief(Actor.TEACHER, brief, "brief")
-    flow.lock_policies(Actor.TEACHER, policies, "policies")
-    task = make_package(tmp_path / "task")
-    health = tmp_path / "preflight.json"
-    health.write_text(json.dumps({
-        "oracle_full_score": True,
-        "independent_honest_executed": True,
-        "adversarial_low_score": True,
-        "environment_stable": False,
-        "package_compliant": True,
-        "no_hidden_leakage": True,
-    }))
-
-    assert main(["begin-authoring", str(run)]) == 0
-    capsys.readouterr()
-    role_map, ledger = write_design_evidence(brief, tmp_path)
-    assert main([
-        "attach-design-evidence", str(run), str(role_map), str(ledger),
-    ]) == 0
-    capsys.readouterr()
-    assert main(["freeze-package", str(run), str(task)]) == 0
-    capsys.readouterr()
-    assert main([
-        "accept-health", str(run), str(health),
-        "--evidence-ref", "reviewer/preflight.json",
-    ]) == 0
-    capsys.readouterr()
-    assert main(["start-blind", str(run)]) == 0
-
-    result = json.loads(capsys.readouterr().out)
-    assert result["state"] == "BLIND_VALIDATION"
-    assert result["environment_key"] is None
-
-
-def test_freeze_package_idempotency_is_scoped_to_question_revision(tmp_path, capsys) -> None:
-    run = tmp_path / "run"
-    run.mkdir()
-    (run / "state.json").write_text(json.dumps({
-        "run_id": "run-1",
-        "state": "AUTHORING",
-        "sequence": 0,
-        "question_revision": "r1",
-        "evidence": {"design_evidence": design_links(tmp_path)},
-    }))
-    task = make_package(tmp_path / "task")
-
-    assert main(["freeze-package", str(run), str(task)]) == 0
-    r1 = json.loads(capsys.readouterr().out)
-    assert r1["state"] == "PACKAGE_FROZEN"
-    assert r1["question_revision"] == "r1"
-
-    reason = tmp_path / "environment-revision.json"
-    reason.write_text('{"reason":"runtime environment changed"}')
-    flow = RunWorkflow(RunStore(run))
-    flow.begin_environment_revision(
-        Actor.TEACHER,
-        "r2",
-        reason,
-        "environment-revision:r2",
+        ["validate-question-brief", "3"],
+        ["record-skill-attribution", "3", str(artifact)],
+        ["reconcile-skill-bank", "batch", "--question", "3", "--question", "4"],
+        ["evaluate-skill-candidate", str(artifact), str(artifact)],
+        ["record-validation-round", str(tmp_path / "run"), "request-1"],
+        ["begin-difficulty-revision", str(tmp_path / "run"), "r2", str(artifact)],
+        ["accept-runtime-delta", str(tmp_path / "run"), str(artifact)],
+        ["migrate-incomplete-validation", str(tmp_path / "run"), "r2"],
+        ["accept-runtime-closure", str(tmp_path / "run"), str(artifact)],
+        ["bind-runtime-environment", str(tmp_path / "run"), str(artifact)],
+        ["begin-runtime-finalization", str(tmp_path / "run")],
     )
-    revised_state = json.loads((run / "state.json").read_text())
-    revised_state.setdefault("evidence", {})["design_evidence"] = design_links(tmp_path)
-    (run / "state.json").write_text(json.dumps(revised_state))
-
-    assert main(["freeze-package", str(run), str(task)]) == 0
-    r2 = json.loads(capsys.readouterr().out)
-    assert r2["state"] == "PACKAGE_FROZEN"
-    assert r2["question_revision"] == "r2"
-    sequence = r2["sequence"]
-    events = RunStore(run).events()
-    event_count = len(events)
-    digest = package_sha256(task)
-    freeze_keys = [event.idempotency_key for event in events if event.event_type == "package.frozen"]
-    assert freeze_keys == [
-        f"package:freeze:r1:{digest}",
-        f"package:freeze:r2:{digest}",
-    ]
-
-    assert main(["freeze-package", str(run), str(task)]) == 0
-    replay = json.loads(capsys.readouterr().out)
-    assert replay["sequence"] == sequence
-    assert len(RunStore(run).events()) == event_count
-
-
-def test_accept_health_idempotency_is_scoped_to_question_revision(tmp_path, capsys) -> None:
-    run = tmp_path / "run"
-    run.mkdir()
-    (run / "state.json").write_text(json.dumps({
-        "run_id": "run-1",
-        "state": "AUTHORING",
-        "sequence": 0,
-        "question_revision": "r1",
-        "evidence": {"design_evidence": design_links(tmp_path)},
-    }))
-    task = make_package(tmp_path / "task")
-    health_path = tmp_path / "preflight.json"
-    health_path.write_text(json.dumps({
-        "oracle_full_score": True,
-        "independent_honest_executed": True,
-        "adversarial_low_score": True,
-        "environment_stable": False,
-        "package_compliant": True,
-        "no_hidden_leakage": True,
-    }))
-    health_command = [
-        "accept-health", str(run), str(health_path),
-        "--evidence-ref", "reviewer/preflight.json",
-    ]
-
-    assert main(["freeze-package", str(run), str(task)]) == 0
-    capsys.readouterr()
-    assert main(health_command) == 0
-    r1 = json.loads(capsys.readouterr().out)
-    assert r1["state"] == "PREFLIGHT_PASSED"
-
-    flow = RunWorkflow(RunStore(run))
-    flow.start_blind_validation(Actor.TEACHER, "workflow:blind:r1")
-    reason = tmp_path / "environment-revision.json"
-    reason.write_text('{"reason":"runtime environment changed"}')
-    flow.begin_environment_revision(
-        Actor.TEACHER,
-        "r2",
-        reason,
-        "environment-revision:r2",
-    )
-    revised_state = json.loads((run / "state.json").read_text())
-    revised_state.setdefault("evidence", {})["design_evidence"] = design_links(tmp_path)
-    (run / "state.json").write_text(json.dumps(revised_state))
-    assert main(["freeze-package", str(run), str(task)]) == 0
-    capsys.readouterr()
-
-    assert main(health_command) == 0
-    r2 = json.loads(capsys.readouterr().out)
-    assert r2["state"] == "PREFLIGHT_PASSED"
-    assert r2["question_revision"] == "r2"
-    sequence = r2["sequence"]
-    events = RunStore(run).events()
-    event_count = len(events)
-    health_keys = [event.idempotency_key for event in events if event.event_type == "health.preflight.accepted"]
-    assert health_keys == ["health:r1:preflight.json", "health:r2:preflight.json"]
-
-    assert main(health_command) == 0
-    replay = json.loads(capsys.readouterr().out)
-    assert replay["sequence"] == sequence
-    assert len(RunStore(run).events()) == event_count
-
-
-def test_start_blind_idempotency_is_scoped_to_question_revision(tmp_path, capsys) -> None:
-    run = tmp_path / "run"
-    run.mkdir()
-    (run / "state.json").write_text(json.dumps({
-        "run_id": "run-1",
-        "state": "AUTHORING",
-        "sequence": 0,
-        "question_revision": "r1",
-        "evidence": {"design_evidence": design_links(tmp_path)},
-    }))
-    task = make_package(tmp_path / "task")
-    health_path = tmp_path / "preflight.json"
-    health_path.write_text(json.dumps({
-        "oracle_full_score": True,
-        "independent_honest_executed": True,
-        "adversarial_low_score": True,
-        "environment_stable": False,
-        "package_compliant": True,
-        "no_hidden_leakage": True,
-    }))
-    health_command = [
-        "accept-health", str(run), str(health_path),
-        "--evidence-ref", "reviewer/preflight.json",
-    ]
-
-    assert main(["freeze-package", str(run), str(task)]) == 0
-    capsys.readouterr()
-    assert main(health_command) == 0
-    capsys.readouterr()
-    assert main(["start-blind", str(run)]) == 0
-    r1 = json.loads(capsys.readouterr().out)
-    assert r1["state"] == "BLIND_VALIDATION"
-
-    r1_sequence = r1["sequence"]
-    r1_event_count = len(RunStore(run).events())
-    assert main(["start-blind", str(run)]) == 0
-    r1_replay = json.loads(capsys.readouterr().out)
-    assert r1_replay["sequence"] == r1_sequence
-    assert len(RunStore(run).events()) == r1_event_count
-
-    reason = tmp_path / "environment-revision.json"
-    reason.write_text('{"reason":"runtime environment changed"}')
-    RunWorkflow(RunStore(run)).begin_environment_revision(
-        Actor.TEACHER,
-        "r2",
-        reason,
-        "environment-revision:r2",
-    )
-    revised_state = json.loads((run / "state.json").read_text())
-    revised_state.setdefault("evidence", {})["design_evidence"] = design_links(tmp_path)
-    (run / "state.json").write_text(json.dumps(revised_state))
-    assert main(["freeze-package", str(run), str(task)]) == 0
-    capsys.readouterr()
-    assert main(health_command) == 0
-    capsys.readouterr()
-
-    assert main(["start-blind", str(run)]) == 0
-    r2 = json.loads(capsys.readouterr().out)
-    assert r2["state"] == "BLIND_VALIDATION"
-    assert r2["question_revision"] == "r2"
-    events = RunStore(run).events()
-    blind_keys = [event.idempotency_key for event in events if event.event_type == "validation.blind.started"]
-    assert blind_keys == [
-        "validation:blind:r1:start",
-        "validation:blind:r2:start",
-    ]
-
-    sequence = r2["sequence"]
-    event_count = len(events)
-    assert main(["start-blind", str(run)]) == 0
-    r2_replay = json.loads(capsys.readouterr().out)
-    assert r2_replay["sequence"] == sequence
-    assert len(RunStore(run).events()) == event_count
+    for command in commands:
+        assert main(command) == 0
+        assert json.loads(capsys.readouterr().out)
 
 
 def test_import_environment_command(tmp_path, capsys) -> None:
@@ -403,23 +197,13 @@ def test_import_environment_command(tmp_path, capsys) -> None:
     assert json.loads(capsys.readouterr().out)["lifecycle"] == "STABLE"
 
 
-def test_lint_and_migrate_commands(tmp_path, capsys) -> None:
+def test_lint_package_command(tmp_path, capsys) -> None:
     task = make_package(tmp_path / "task")
     assert main(["lint-package", str(task)]) == 0
     assert json.loads(capsys.readouterr().out)["passed"]
 
-    legacy = make_package(tmp_path / "legacy")
-    (legacy / "environment/resources.yaml").unlink()
-    (legacy / "public_data").mkdir()
-    (legacy / "public_data/input.csv").write_text("x\n")
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"status": "ENVIRONMENT_READY", "image": {"immutable": True}}))
-    target = tmp_path / "target"
-    assert main(["migrate-task", str(legacy), str(target), "--manifest", str(manifest)]) == 0
-    assert json.loads(capsys.readouterr().out)["passed"]
 
-
-def test_build_config_and_issue_researcher_commands(tmp_path, capsys) -> None:
+def test_build_config_and_issue_researcher_commands(tmp_path, capsys, monkeypatch) -> None:
     task = make_package(tmp_path / "task")
     jobs = tmp_path / "jobs"
     jobs.mkdir()
@@ -457,25 +241,19 @@ def test_build_config_and_issue_researcher_commands(tmp_path, capsys) -> None:
     config = tmp_path / "job.json"
     main(["build-harbor-config", str(spec), str(runtime), str(config)])
     capsys.readouterr()
-    request = tmp_path / "request.json"
-    request.write_text(
-        json.dumps(
-            {
-                "request_id": "request-1",
-                "run_id": "run-1",
-                "question_revision": "r1",
-                "attempt_index": 1,
-                "mode": "blind",
-                "package_path": str(task),
-                "package_sha256": package_sha256(task),
-                "job_config_path": str(config),
-                "job_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
-                "context_digests": [],
-                "researcher_thread_id": "breaker",
-            }
-        )
+    handoff_root = tmp_path / "run/researcher-requests/request-1"
+    handoff_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        "taskfoundry.cli.RunWorkflow.issue_researcher_request",
+        lambda self, actor, **kwargs: IssuedHandoff(
+            str(handoff_root / "request.json"),
+            str(handoff_root / "capability.json"),
+            str(handoff_root / "token"),
+        ),
     )
-    assert main(["issue-researcher", str(request), str(tmp_path / "handoffs")]) == 0
+    assert main(
+        ["issue-researcher", str(tmp_path / "run"), "request-1", str(config)]
+    ) == 0
     assert Path(json.loads(capsys.readouterr().out)["handoff_path"]).is_file()
 
 
@@ -557,6 +335,46 @@ def test_dispatch_and_researcher_run_handlers(tmp_path, capsys, monkeypatch) -> 
     assert json.loads((queue_root / "harbor-queue.json").read_text())["jobs"][0]["state"] == "COMPLETED"
 
 
+def test_researcher_run_rejects_invalid_runtime_before_redeeming_or_queueing(
+    tmp_path, monkeypatch
+) -> None:
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"request_id": "r", "job_config_path": str(tmp_path / "job.json")}))
+    handoff = tmp_path / "handoff.json"
+    handoff.write_text(json.dumps({
+        "request_path": str(request),
+        "capability_path": str(tmp_path / "capability.json"),
+        "token_path": str(tmp_path / "token"),
+    }))
+    invalid_runtime = tmp_path / "invalid-runtime.json"
+    invalid_runtime.write_text(json.dumps({"agents": []}))
+    env_file = tmp_path / ".env"
+    env_file.write_text("X=1\n")
+    monkeypatch.setenv("CODEX_THREAD_ID", "breaker")
+    redeemed = False
+
+    def fail_if_redeemed(*args):
+        nonlocal redeemed
+        redeemed = True
+        raise AssertionError("invalid runtime consumed the capability")
+
+    monkeypatch.setattr("taskfoundry.cli.CapabilityStore.redeem", fail_if_redeemed)
+    with pytest.raises(TypeError):
+        main([
+            "researcher-run",
+            str(handoff),
+            str(invalid_runtime),
+            "--env-file",
+            str(env_file),
+            "--receipt",
+            str(tmp_path / "receipt.json"),
+            "--queue-root",
+            str(tmp_path / "harbor-queue"),
+        ])
+    assert redeemed is False
+    assert not (tmp_path / "harbor-queue/harbor-queue.json").exists()
+
+
 def test_scheduler_commands_activate_and_report_question(tmp_path, capsys) -> None:
     run = tmp_path / "run"
     RunStore(run).initialize("q3")
@@ -595,15 +413,15 @@ def test_scheduler_commands_activate_and_report_question(tmp_path, capsys) -> No
     assert len(json.loads(capsys.readouterr().out)["questions"]) == 32
 
 
-def test_scheduler_limit_command_reports_fixed_three_slots(tmp_path, capsys) -> None:
+def test_scheduler_limit_command_updates_slots(tmp_path, capsys) -> None:
     root = tmp_path / "scheduler"
 
-    assert main(["scheduler-set-limit", str(root), "3"]) == 0
+    assert main(["scheduler-set-limit", str(root), "1"]) == 0
 
     result = json.loads(capsys.readouterr().out)
-    assert result["snapshot"]["max_active"] == 3
+    assert result["snapshot"]["max_active"] == 1
     assert main(["scheduler-status", str(root)]) == 0
-    assert json.loads(capsys.readouterr().out)["max_active"] == 3
+    assert json.loads(capsys.readouterr().out)["max_active"] == 1
 
 
 def test_scheduler_wait_and_resume_commands_release_slot(tmp_path, capsys) -> None:
@@ -665,16 +483,26 @@ def test_scheduler_cli_binds_validated_family_before_marking_complete(
 ) -> None:
     validated: list[tuple[int, Path]] = []
 
-    def validate_family(question: int, family: Path) -> None:
-        validated.append((question, family))
+    trace = tmp_path / "questions" / "3" / "trace/final/package-digest"
+    trace.mkdir(parents=True)
 
-    monkeypatch.setattr(scheduler_module, "_default_validate_published_family", validate_family)
+    def validate_family(question: int, family: Path, _run: object) -> Path:
+        validated.append((question, family))
+        return trace
+
+    monkeypatch.setattr(scheduler_module, "_default_finalize_published_family", validate_family)
     run = tmp_path / "run"
     RunStore(run).initialize("q3")
     prompt = tmp_path / "teacher.md"
     prompt.write_text("[TASKFOUNDRY ROLE=teacher]\n继续正式出题。\n")
-    family = tmp_path / "questions" / "3" / "new-question" / "family"
+    family = tmp_path / "questions" / "3" / "question-pack"
     family.mkdir(parents=True)
+    monkeypatch.setattr(scheduler_module, "published_family_path", lambda _number: family)
+    monkeypatch.setattr(
+        scheduler_module.QuestionScheduler,
+        "_reconcile_batch_at_completion",
+        lambda *args: None,
+    )
     root = tmp_path / "scheduler"
     assert main([
         "scheduler-enqueue",
@@ -709,7 +537,6 @@ def test_scheduler_cli_binds_validated_family_before_marking_complete(
         "scheduler-bind-published-family",
         str(root),
         "q3",
-        str(family),
         "--owner-id",
         q3["lease"]["owner_id"],
         "--lease-id",
@@ -901,116 +728,11 @@ def test_labwright_delta_cli_round_trip(tmp_path, capsys) -> None:
     assert plan.is_file()
 
 
-def test_accept_bound_health_command_rejects_legacy_environment(tmp_path, capsys) -> None:
-    run = tmp_path / "run"
-    run.mkdir()
-    (run / "state.json").write_text(json.dumps({
-        "run_id": "run-1",
-        "state": "PACKAGE_FROZEN",
-        "sequence": 0,
-        "package_digest": "a" * 64,
-        "environment_key": "b" * 64,
-    }))
-    evidence = []
-    for gate in (
-        HealthGate.PACKAGE,
-        HealthGate.ENVIRONMENT,
-        HealthGate.ORACLE,
-        HealthGate.HONEST,
-        HealthGate.ADVERSARIAL,
-        HealthGate.LEAKAGE,
-    ):
-        path = tmp_path / f"{gate.value}.json"
-        path.write_text(f'{{"gate":"{gate.value}"}}')
-        evidence.append((gate, path))
-    bundle = BoundHealthEvidence.create(
-        question_revision="r1",
-        package_sha256="a" * 64,
-        environment_key="b" * 64,
-        health=HealthEvidence(True, True, True, True, True, True),
-        evidence=evidence,
-    )
-    bundle_path = tmp_path / "bound-health.json"
-    bundle_path.write_text(json.dumps(bundle.to_dict()))
-
-    with pytest.raises(RuntimeError, match="runtime closure"):
-        main(["accept-bound-health", str(run), str(bundle_path)])
-
-
-def test_accept_bound_health_command_requires_closure_even_after_trace(tmp_path, capsys) -> None:
-    run = tmp_path / "run"
-    run.mkdir()
-    (run / "state.json").write_text(json.dumps({
-        "run_id": "run-1",
-        "state": "BLIND_VALIDATION",
-        "sequence": 0,
-        "question_revision": "r2",
-        "package_digest": "a" * 64,
-        "environment_key": "b" * 64,
-        "attempts": [{"classification": "SCIENTIFIC_RESULT"}],
-    }))
-    evidence = []
-    for gate in (
-        HealthGate.PACKAGE,
-        HealthGate.ENVIRONMENT,
-        HealthGate.ORACLE,
-        HealthGate.HONEST,
-        HealthGate.ADVERSARIAL,
-        HealthGate.LEAKAGE,
-    ):
-        path = tmp_path / f"runtime-{gate.value}.json"
-        path.write_text(f'{{"gate":"{gate.value}"}}')
-        evidence.append((gate, path))
-    bundle = BoundHealthEvidence.create(
-        question_revision="r2",
-        package_sha256="a" * 64,
-        environment_key="b" * 64,
-        health=HealthEvidence(True, True, True, True, True, True),
-        evidence=evidence,
-    )
-    bundle_path = tmp_path / "runtime-bound-health.json"
-    bundle_path.write_text(json.dumps(bundle.to_dict()))
-
-    with pytest.raises(RuntimeError, match="runtime closure"):
-        main(["accept-bound-health", str(run), str(bundle_path)])
-
-
-def test_legacy_health_and_blind_commands_remain_compatible(tmp_path, capsys) -> None:
-    run = tmp_path / "run"
-    run.mkdir()
-    (run / "state.json").write_text(json.dumps({
-        "run_id": "run-1",
-        "state": "PACKAGE_FROZEN",
-        "sequence": 0,
-    }))
-    health = tmp_path / "health.json"
-    health.write_text(json.dumps({
-        "oracle_full_score": True,
-        "independent_honest_executed": True,
-        "adversarial_low_score": True,
-        "environment_stable": True,
-        "package_compliant": True,
-        "no_hidden_leakage": True,
-    }))
-
-    assert main([
-        "accept-health",
-        str(run),
-        str(health),
-        "--evidence-ref",
-        "legacy-evidence.json",
-    ]) == 0
-    assert json.loads(capsys.readouterr().out)["state"] == "ORACLE_PASSED"
-
-    assert main(["start-blind", str(run)]) == 0
-    assert json.loads(capsys.readouterr().out)["state"] == "BLIND_VALIDATION"
-
-
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
-        ('{"oracle_full_score":true,"oracle_full_score":true}', "duplicate key"),
-        ('{"oracle_full_score":NaN}', "non-finite number"),
+        ('{"oracle_full_score":true,"oracle_full_score":true}', "duplicate evidence JSON key"),
+        ('{"oracle_full_score":NaN}', "non-finite evidence JSON number"),
     ],
 )
 def test_cli_json_inputs_fail_closed_on_ambiguous_numbers_and_keys(
@@ -1021,8 +743,13 @@ def test_cli_json_inputs_fail_closed_on_ambiguous_numbers_and_keys(
     """所有 CLI JSON 入口必须拒绝重复键和非有限常量。"""
     run = tmp_path / "run"
     run.mkdir()
-    health = tmp_path / "health.json"
-    health.write_text(payload)
+    (run / "state.json").write_text(json.dumps({
+        "run_id": "run-1",
+        "state": "BLIND_VALIDATION",
+        "sequence": 0,
+    }))
+    bundle = tmp_path / "runtime-delta.json"
+    bundle.write_text(payload)
 
-    with pytest.raises(SystemExit, match=message):
-        main(["accept-health", str(run), str(health), "--evidence-ref", "evidence.json"])
+    with pytest.raises(RuntimeError, match=message):
+        main(["accept-runtime-delta", str(run), str(bundle)])

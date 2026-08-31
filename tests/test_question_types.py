@@ -1,6 +1,11 @@
 import pytest
 
-from taskfoundry.model import ContractError, QuestionDesignBrief, SourceQuestion
+from taskfoundry.model import (
+    BackgroundEvidence,
+    ContractError,
+    QuestionDesignBrief,
+    SourceQuestion,
+)
 from taskfoundry.question_types import QuestionTypeRegistry
 
 
@@ -29,6 +34,87 @@ def _brief() -> QuestionDesignBrief:
 
 def test_method_selection_module_accepts_traceable_sources() -> None:
     QuestionTypeRegistry().validate(_brief())
+
+
+def _evidence_contract() -> tuple[BackgroundEvidence, ...]:
+    return (
+        BackgroundEvidence(
+            "load",
+            "The observed response is non-monotone.",
+            "load_bearing",
+            "All declared cases.",
+            "Requires a method that represents the turning point.",
+            ("m2",),
+            ("validation.csv contains both sides of the turning point",),
+        ),
+        BackgroundEvidence(
+            "context",
+            "Both methods are established in this field.",
+            "context_only",
+            "General literature context.",
+            "Establishes plausibility without selecting a method.",
+        ),
+        BackgroundEvidence(
+            "d1",
+            "Method one is efficient for monotone responses.",
+            "conditional_distractor",
+            "The response is monotone.",
+            "Exclude it because the current response is non-monotone.",
+            ("m1",),
+            ("the public response reverses direction",),
+        ),
+        BackgroundEvidence(
+            "d2",
+            "Method two can overfit when observations are sparse.",
+            "conditional_distractor",
+            "Only a few observations are available.",
+            "Do not exclude it because the public design is dense.",
+            ("m2",),
+            ("the public design declares a dense observation grid",),
+        ),
+    )
+
+
+def test_method_selection_background_evidence_contract_accepts_fair_distractors() -> None:
+    brief = QuestionDesignBrief(
+        **(_brief().__dict__ | {"background_evidence": _evidence_contract()})
+    )
+
+    from taskfoundry.question_types import MethodSelectionModule
+
+    MethodSelectionModule().validate_background_evidence(brief)
+
+
+@pytest.mark.parametrize(
+    "evidence,message",
+    [
+        (_evidence_contract()[:2], "roles"),
+        (_evidence_contract()[:3], "two conditional distractors"),
+        (
+            _evidence_contract()[:-1]
+            + (
+                BackgroundEvidence(
+                    "d2",
+                    "An alternate method is tempting.",
+                    "conditional_distractor",
+                    "An alternate regime.",
+                    "Exclude it using public evidence.",
+                    ("unknown",),
+                    ("the public regime differs",),
+                ),
+            ),
+            "unknown method",
+        ),
+    ],
+)
+def test_method_selection_background_evidence_contract_rejects_incomplete_maps(
+    evidence, message
+) -> None:
+    from taskfoundry.question_types import MethodSelectionModule
+
+    brief = QuestionDesignBrief(**(_brief().__dict__ | {"background_evidence": evidence}))
+    with pytest.raises(ContractError, match=message):
+        MethodSelectionModule().validate_background_evidence(brief)
 
 
 def test_method_selection_module_rejects_single_paper() -> None:
