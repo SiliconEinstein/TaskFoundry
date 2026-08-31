@@ -21,7 +21,7 @@ from taskfoundry.labwright_runtime import (
 )
 from taskfoundry.model import Actor, RunSnapshot, RunState
 from taskfoundry.store import RunStore
-from taskfoundry.researcher import ApprovedHint, ResearcherRequest
+from taskfoundry.researcher import ApprovedHint, CapabilityStore, ResearcherRequest
 from taskfoundry.validation import AttemptEvidence, JobClassification
 from taskfoundry.workflow import RunWorkflow, WorkflowError
 
@@ -452,6 +452,7 @@ def test_direct_start_atomically_freezes_and_opens_linear_session(tmp_path) -> N
         "schema_version": 2,
         "validation_session_id": "validation-session-1",
         "researcher_thread_id": "researcher-thread-1",
+        "execution_owner": "desktop-thread",
         "question_revision": "r1",
         "package_sha256": snapshot.package_digest,
         "status": "ACTIVE",
@@ -797,6 +798,63 @@ def test_workflow_issues_one_schema3_request_for_persistent_harbor_session(
         == request.controller_dir
     )
     assert frozen["extra_instruction_paths"] == []
+
+
+def test_workflow_uses_runtime_owned_researcher_without_desktop_thread(
+    tmp_path,
+) -> None:
+    flow = direct_workflow(tmp_path)
+    flow.freeze_and_start_validation_session(
+        Actor.TEACHER,
+        package=package(tmp_path / "runtime-owned-task"),
+        validation_session_id="runtime-session-1",
+        researcher_thread_id=None,
+        idempotency_key="runtime-owned-start",
+    )
+    config = tmp_path / "runtime-owned-job-config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "tasks": [{"path": flow.snapshot.package_path}],
+                "agents": [
+                    {
+                        "model_name": "matmaster/gpt-5.6-sol",
+                        "kwargs": {
+                            "persistent_validation": {
+                                "schema_version": 1,
+                                "validation_session_id": "runtime-session-1",
+                                "controller_dir": str(tmp_path / "controller"),
+                                "pass_threshold": 0.85,
+                                "max_blind_rounds": 3,
+                                "max_hint_rounds": 2,
+                                "decision_timeout_sec": 10800,
+                            }
+                        },
+                    }
+                ],
+                "environment": {"type": "lbg", "kwargs": {"project_id": 42}},
+                "extra_instruction_paths": [],
+            }
+        )
+    )
+
+    handoff = flow.issue_researcher_request(
+        Actor.TEACHER,
+        request_id="runtime-owned-request-1",
+        job_config_path=config,
+    )
+    request = ResearcherRequest.from_dict(
+        json.loads(Path(handoff.request_path).read_text())
+    )
+
+    assert request.schema_version == 4
+    assert request.researcher_thread_id == "harbor-runtime:runtime-session-1"
+    assert (
+        CapabilityStore(flow.store.run_dir / "researcher-requests")
+        .redeem_runtime(handoff)
+        .request_id
+        == "runtime-owned-request-1"
+    )
 
 
 def test_workflow_atomically_imports_persistent_first_blind_pass(

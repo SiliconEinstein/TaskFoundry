@@ -1,0 +1,3 @@
+# Use a durable supervisor instead of Desktop Researcher tasks
+
+TaskFoundry uses one durable `CampaignSupervisor` to advance question runs, launch Harbor, recover non-scientific failures, and close Skill Bank evidence. A Desktop Researcher task is no longer a launch prerequisite: the fresh Codex identity created inside the Harbor sandbox is the Researcher identity of record. This avoids a second, failure-prone coordination system while preserving a persistent Researcher sandbox/session, fresh verifier sandboxes, immutable scientific packages, and auditable execution identities. Platform outages enter a recoverable External Wait; they never abandon a scientific topic or count as a Scientific Round.

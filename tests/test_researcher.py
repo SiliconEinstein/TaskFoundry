@@ -19,6 +19,7 @@ from taskfoundry.researcher import (
     execute_harbor,
     extract_attempt_identifiers,
     validate_launch_contract,
+    runtime_researcher_identity,
 )
 from taskfoundry.harbor import DshRuntime
 
@@ -91,6 +92,12 @@ def test_teacher_cannot_redeem_researcher_capability(tmp_path) -> None:
     handoff = store.issue(Actor.TEACHER, request(tmp_path))
     with pytest.raises(ResearcherError, match="designated"):
         store.redeem(handoff, "teacher-thread")
+
+
+def test_runtime_researcher_identity_rejects_unsafe_session() -> None:
+    assert runtime_researcher_identity("session-1") == "harbor-runtime:session-1"
+    with pytest.raises(ContractError, match="not safe"):
+        runtime_researcher_identity("../session")
 
 
 def test_only_teacher_can_issue_and_ids_are_one_use(tmp_path) -> None:
@@ -351,7 +358,7 @@ def test_linear_hint_rejects_extra_context_or_answer_declaration(tmp_path) -> No
 @pytest.mark.parametrize(
     "changes,message",
     [
-        ({"schema_version": 4}, "unsupported"),
+        ({"schema_version": 5}, "unsupported"),
         ({"schema_version": 2, "validation_session_id": None, "round_index": 1}, "matching session"),
         ({"schema_version": 2, "validation_session_id": "s", "round_index": 2}, "matching session"),
         ({

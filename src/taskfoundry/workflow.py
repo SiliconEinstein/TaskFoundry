@@ -23,6 +23,7 @@ from .researcher import (
     IssuedHandoff,
     ResearcherError,
     ResearcherRequest,
+    runtime_researcher_identity,
 )
 from .skillbank import validate_activation, validate_latest_brief
 from .store import RunStore
@@ -221,19 +222,22 @@ class RunWorkflow:
         *,
         package: Path,
         validation_session_id: str,
-        researcher_thread_id: str,
+        researcher_thread_id: str | None,
         idempotency_key: str,
     ) -> RunSnapshot:
         """最小启动检查后原子冻结题包并打开线性 Harbor 验证会话。"""
         from .package import package_sha256
 
         source_package_sha256 = package_sha256(package)
+        effective_researcher_id = researcher_thread_id or runtime_researcher_identity(
+            validation_session_id
+        )
         repeated = self._idempotent_snapshot(
             idempotency_key,
             "validation.session.started",
             {
                 "validation_session_id": validation_session_id,
-                "researcher_thread_id": researcher_thread_id,
+                "researcher_thread_id": effective_researcher_id,
                 "source_package_sha256": source_package_sha256,
             },
         )
@@ -241,7 +245,7 @@ class RunWorkflow:
             return repeated
         current = self._guard(actor, {Actor.TEACHER}, {RunState.AUTHORING})
         self._revalidate_teacher_knowledge(current, require_author=True)
-        if not validation_session_id.strip() or not researcher_thread_id.strip():
+        if not validation_session_id.strip() or not effective_researcher_id.strip():
             raise WorkflowError("validation session and Researcher thread are required")
         snapshot_path = (
             self.store.run_dir
@@ -258,13 +262,18 @@ class RunWorkflow:
             run_id=current.run_id,
             question_revision=current.question_revision,
             validation_session_id=validation_session_id,
-            researcher_thread_id=researcher_thread_id,
+            researcher_thread_id=effective_researcher_id,
             package_sha256=report.package_sha256,
         )
         session = {
             "schema_version": 2,
             "validation_session_id": validation_session_id,
-            "researcher_thread_id": researcher_thread_id,
+            "researcher_thread_id": effective_researcher_id,
+            "execution_owner": (
+                "harbor-runtime"
+                if researcher_thread_id is None
+                else "desktop-thread"
+            ),
             "question_revision": current.question_revision,
             "package_sha256": report.package_sha256,
             "status": "ACTIVE",
@@ -289,7 +298,7 @@ class RunWorkflow:
                 "package_sha256": report.package_sha256,
                 "source_package_sha256": source_package_sha256,
                 "validation_session_id": validation_session_id,
-                "researcher_thread_id": researcher_thread_id,
+                "researcher_thread_id": effective_researcher_id,
             },
             next_snapshot,
         )
@@ -469,7 +478,11 @@ class RunWorkflow:
             validation_session_id=str(session.get("validation_session_id", "")),
             controller_dir=str(controller_dir.resolve()),
             model=model_name,
-            schema_version=3,
+            schema_version=(
+                4
+                if str(session.get("execution_owner", "")) == "harbor-runtime"
+                else 3
+            ),
         )
         try:
             request.validate()
@@ -510,7 +523,7 @@ class RunWorkflow:
                 f"persistent request cannot be loaded: {error}"
             ) from error
         if (
-            request.schema_version != 3
+            request.schema_version not in {3, 4}
             or request.validation_session_id != session.get("validation_session_id")
             or request.package_sha256 != current.package_digest
         ):
@@ -1138,7 +1151,7 @@ class RunWorkflow:
                 researcher_thread_id=request.researcher_thread_id,
                 control_result_sha256=item.result_sha256,
                 control_decision_sha256=item.decision_sha256,
-                schema_version=3,
+                schema_version=request.schema_version,
             )
             for item in verified.rounds
         )

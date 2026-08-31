@@ -38,13 +38,17 @@ from .researcher import (
 from .scheduler import QuestionScheduler
 from .scheduler_worker import SchedulerWorker
 from .skillbank import (
+    close_skill_batch,
     evaluate_skill_candidate,
     reconcile_skill_batch,
     record_skill_attribution,
+    record_revision_attribution,
     resolve_teacher_activation,
     validate_latest_brief,
 )
 from .store import RunStore
+from .supervisor import CampaignSupervisor, register_supervisor_plan
+from .supervisor_state import SupervisorPlan
 from .validation_control import TeacherDecision
 from .workflow import RunWorkflow
 
@@ -94,9 +98,19 @@ def parser() -> argparse.ArgumentParser:
     attribution.add_argument("question", type=int, choices=range(3, 33))
     attribution.add_argument("evidence", type=Path)
 
+    revision_attribution = commands.add_parser("record-revision-attribution")
+    revision_attribution.add_argument("question", type=int, choices=range(3, 33))
+    revision_attribution.add_argument("evidence", type=Path)
+
     reconcile = commands.add_parser("reconcile-skill-bank")
     reconcile.add_argument("batch_id")
     reconcile.add_argument(
+        "--question", type=int, choices=range(3, 33), action="append", required=True
+    )
+
+    close_batch = commands.add_parser("close-skill-batch")
+    close_batch.add_argument("batch_id")
+    close_batch.add_argument(
         "--question", type=int, choices=range(3, 33), action="append", required=True
     )
 
@@ -108,7 +122,7 @@ def parser() -> argparse.ArgumentParser:
     direct.add_argument("run_dir", type=Path)
     direct.add_argument("package", type=Path)
     direct.add_argument("--validation-session-id", required=True)
-    direct.add_argument("--researcher-thread-id", required=True)
+    direct.add_argument("--researcher-thread-id")
 
     record_round = commands.add_parser("record-validation-round")
     record_round.add_argument("run_dir", type=Path)
@@ -201,6 +215,28 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--overall-timeout-sec", type=int, default=7200)
     run.add_argument("--queue-root", type=Path, required=True)
     run.add_argument("--claim-id")
+
+    runtime_run = commands.add_parser("runtime-researcher-run")
+    runtime_run.add_argument("handoff", type=Path)
+    runtime_run.add_argument("runtime", type=Path)
+    runtime_run.add_argument("--env-file", type=Path, required=True)
+    runtime_run.add_argument("--receipt", type=Path, required=True)
+    runtime_run.add_argument("--overall-timeout-sec", type=int, default=7200)
+    runtime_run.add_argument("--queue-root", type=Path, required=True)
+    runtime_run.add_argument("--claim-id")
+
+    supervisor_register = commands.add_parser("supervisor-register")
+    supervisor_register.add_argument("plan", type=Path)
+
+    supervise = commands.add_parser("supervise")
+    supervise.add_argument("runs_root", type=Path)
+    supervise.add_argument("--once", action="store_true")
+    supervise.add_argument("--poll-interval-sec", type=float, default=1.0)
+    supervise.add_argument("--stop-file", type=Path)
+
+    supervisor_resume = commands.add_parser("supervisor-resume")
+    supervisor_resume.add_argument("runs_root", type=Path)
+    supervisor_resume.add_argument("question_id")
 
     harbor_queue_status = commands.add_parser("harbor-queue-status")
     harbor_queue_status.add_argument("queue_root", type=Path)
@@ -313,7 +349,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "resolve-teacher-skill": _resolve_teacher_skill,
         "validate-question-brief": _validate_question_brief,
         "record-skill-attribution": _record_skill_attribution,
+        "record-revision-attribution": _record_revision_attribution,
         "reconcile-skill-bank": _reconcile_skill_bank,
+        "close-skill-batch": _close_skill_batch,
         "evaluate-skill-candidate": _evaluate_skill_candidate,
         "freeze-and-start-validation": _freeze_and_start_validation,
         "record-validation-round": _record_validation_round,
@@ -332,6 +370,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "revoke-researcher": _revoke_researcher,
         "dispatch": _dispatch,
         "researcher-run": _researcher_run,
+        "runtime-researcher-run": _runtime_researcher_run,
+        "supervisor-register": _supervisor_register,
+        "supervise": _supervise,
+        "supervisor-resume": _supervisor_resume,
         "harbor-queue-status": _harbor_queue_status,
         "harbor-queue-submit": _harbor_queue_submit,
         "harbor-queue-claim": _harbor_queue_claim,
@@ -451,8 +493,16 @@ def _record_skill_attribution(args: argparse.Namespace) -> dict[str, Any]:
     return {"question": f"q{args.question}", "attribution_path": str(path)}
 
 
+def _record_revision_attribution(args: argparse.Namespace) -> dict[str, Any]:
+    return record_revision_attribution(args.question, args.evidence)
+
+
 def _reconcile_skill_bank(args: argparse.Namespace) -> dict[str, Any]:
     return reconcile_skill_batch(args.batch_id, tuple(args.question))
+
+
+def _close_skill_batch(args: argparse.Namespace) -> dict[str, Any]:
+    return close_skill_batch(args.batch_id, tuple(args.question))
 
 
 def _evaluate_skill_candidate(args: argparse.Namespace) -> dict[str, Any]:
@@ -655,6 +705,48 @@ def _researcher_run(args: argparse.Namespace) -> dict[str, Any]:
     thread_id = os.environ.get("CODEX_THREAD_ID", "")
     if not thread_id:
         raise SystemExit("CODEX_THREAD_ID is required for Researcher attestation")
+    return _execute_researcher_handoff(args, thread_id=thread_id, runtime_owned=False)
+
+
+def _runtime_researcher_run(args: argparse.Namespace) -> dict[str, Any]:
+    """由 CampaignSupervisor 直接运行 schema-v4 Harbor request。"""
+    handoff = IssuedHandoff(**_read_json(args.handoff))
+    request = _read_json(Path(handoff.request_path))
+    validation_session_id = request.get("validation_session_id")
+    if not isinstance(validation_session_id, str):
+        raise SystemExit("runtime-owned handoff lacks validation session identity")
+    thread_id = f"harbor-runtime:{validation_session_id}"
+    return _execute_researcher_handoff(args, thread_id=thread_id, runtime_owned=True)
+
+
+def _supervisor_register(args: argparse.Namespace) -> dict[str, Any]:
+    """Bind one immutable question plan to its durable Supervisor state."""
+    plan = SupervisorPlan.from_path(args.plan)
+    snapshot = register_supervisor_plan(plan)
+    return snapshot.to_dict()
+
+
+def _supervise(args: argparse.Namespace) -> dict[str, Any]:
+    """Advance once for automation, or retain ownership until stopped."""
+    supervisor = CampaignSupervisor(args.runs_root)
+    if args.once:
+        return {"results": [asdict(item) for item in supervisor.run_once()]}
+    supervisor.run_forever(
+        poll_interval_sec=args.poll_interval_sec,
+        stop_path=args.stop_file,
+    )
+    return {"status": "STOPPED"}
+
+
+def _supervisor_resume(args: argparse.Namespace) -> dict[str, Any]:
+    """Resume one recovered wait or apply its Teacher action file."""
+    return asdict(CampaignSupervisor(args.runs_root).resume(args.question_id))
+
+
+def _execute_researcher_handoff(
+    args: argparse.Namespace, *, thread_id: str, runtime_owned: bool
+) -> dict[str, Any]:
+    """在一个受信 owner 下兑换、排队并执行一次不可变 Harbor request。"""
     if args.receipt.exists():
         raise SystemExit("Researcher receipt already exists and is immutable")
     # Validate the host-controlled runtime before consuming the single-use
@@ -686,7 +778,11 @@ def _researcher_run(args: argparse.Namespace) -> dict[str, Any]:
         claim_id = claim.claim_id
         assert claim_id is not None
     store = CapabilityStore(Path(handoff.capability_path).parents[1])
-    request = store.redeem(handoff, thread_id)
+    request = (
+        store.redeem_runtime(handoff)
+        if runtime_owned
+        else store.redeem(handoff, thread_id)
+    )
     queue.authorize(
         request.request_id,
         claim_id=claim_id,

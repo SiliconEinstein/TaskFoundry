@@ -269,6 +269,9 @@ class QuestionScheduler:
         kind: str,
         external_id: str,
         phase: str,
+        recovery_condition: str = "external result becomes available",
+        next_probe_at: str | None = None,
+        evidence_path: Path | None = None,
     ) -> ScheduleResult:
         """把外部等待从三槽中移除，并在同一事务自动补位。"""
         with self._locked():
@@ -281,10 +284,49 @@ class QuestionScheduler:
                 state=QueueState.WAITING_EXTERNAL,
                 phase=phase,
                 lease=None,
-                wait=ExternalWait(kind=kind, external_id=external_id, since=now.isoformat()),
+                wait=ExternalWait(
+                    kind=kind,
+                    external_id=external_id,
+                    since=now.isoformat(),
+                    recovery_condition=recovery_condition,
+                    next_probe_at=next_probe_at,
+                    evidence_path=(str(evidence_path.resolve()) if evidence_path else None),
+                ),
                 updated_at=now.isoformat(),
             )
             intermediate = self._replace_item(current, waiting, increment=False)
+            result = self._sync_and_fill(intermediate, now)
+            result = replace(result, released=(question_id, *result.released))
+            self._write(result.snapshot)
+            return result
+
+    def abandon_topic(
+        self,
+        question_id: str,
+        *,
+        owner_id: str,
+        lease_id: str,
+        generation: int,
+        evidence_path: Path,
+    ) -> ScheduleResult:
+        """以 Teacher 科学证据终止题材并释放执行槽。"""
+        if not evidence_path.is_file() or evidence_path.is_symlink():
+            raise ContractError("topic abandonment requires regular evidence")
+        with self._locked():
+            current = self.snapshot()
+            item = self._item(current, question_id)
+            now = self._now()
+            self._require_lease(item, owner_id, lease_id, generation, now=now)
+            abandoned = replace(
+                item,
+                state=QueueState.ABANDONED,
+                phase="ABANDONED_TOPIC",
+                lease=None,
+                wait=None,
+                last_run_state=RunState.ABANDONED_TOPIC.value,
+                updated_at=now.isoformat(),
+            )
+            intermediate = self._replace_item(current, abandoned, increment=False)
             result = self._sync_and_fill(intermediate, now)
             result = replace(result, released=(question_id, *result.released))
             self._write(result.snapshot)
@@ -462,6 +504,7 @@ class QuestionScheduler:
                     kind=run.state.value,
                     external_id=f"run:{run.run_id}:{run.sequence}",
                     since=now.isoformat(),
+                    recovery_condition="external execution evidence becomes available",
                 ),
                 last_run_state=run.state.value,
                 updated_at=now.isoformat(),
@@ -471,6 +514,15 @@ class QuestionScheduler:
                 item,
                 state=QueueState.BLOCKED,
                 lease=None,
+                last_run_state=run.state.value,
+                updated_at=now.isoformat(),
+            )
+        if run.state is RunState.ABANDONED_TOPIC:
+            return replace(
+                item,
+                state=QueueState.ABANDONED,
+                lease=None,
+                wait=None,
                 last_run_state=run.state.value,
                 updated_at=now.isoformat(),
             )

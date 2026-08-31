@@ -52,7 +52,7 @@ class AttemptEvidence:
 
     def validate(self) -> None:
         """拒绝不完整、非有限值或阶段不一致的证据。"""
-        if self.schema_version not in {1, 2, 3}:
+        if self.schema_version not in {1, 2, 3, 4}:
             raise ContractError("unsupported attempt evidence schema_version")
         if self.mode not in {"blind", "hint"} or self.attempt_index < 1:
             raise ContractError("invalid attempt stage")
@@ -109,7 +109,7 @@ class AttemptEvidence:
                 not _full_sha256(value) for value in self.prior_round_receipt_sha256s
             ):
                 raise ContractError("prior round record digest is invalid")
-        if self.schema_version == 3:
+        if self.schema_version in {3, 4}:
             if not self.validation_session_id or not self.researcher_thread_id:
                 raise ContractError(
                     "persistent attempt requires session and Researcher thread"
@@ -243,7 +243,7 @@ def decide_validation(
             consecutive_timeouts,
         )
     continuous_session = bool(scientific) and all(
-        item.schema_version in {2, 3} for item in scientific
+        item.schema_version in {2, 3, 4} for item in scientific
     )
     if continuous_session and len(blind) < 3:
         return ValidationDecision(
@@ -305,7 +305,7 @@ def _validate_freshness(attempts: list[AttemptEvidence]) -> None:
     schemas = {item.schema_version for item in scientific}
     if len(schemas) != 1:
         raise ContractError("scientific attempts cannot mix validation protocols")
-    persistent_session = schemas == {3}
+    persistent_session = schemas in ({3}, {4})
     if persistent_session:
         _validate_persistent_identities(scientific)
     else:

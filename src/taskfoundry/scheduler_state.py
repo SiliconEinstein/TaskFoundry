@@ -30,6 +30,7 @@ class QueueState(StrEnum):
     WAITING_EXTERNAL = "WAITING_EXTERNAL"
     RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
     BLOCKED = "BLOCKED"
+    ABANDONED = "ABANDONED"
     COMPLETED = "COMPLETED"
 
     # 兼容旧调用方的符号名；v2 持久值始终使用上面的新名称。
@@ -116,17 +117,31 @@ class ExternalWait:
     kind: str
     external_id: str
     since: str
+    recovery_condition: str = "external result becomes available"
+    next_probe_at: str | None = None
+    evidence_path: str | None = None
 
     def validate(self) -> None:
         """校验等待类别、外部标识和时间。"""
-        if not self.kind or not self.external_id:
+        if not self.kind or not self.external_id or not self.recovery_condition:
             raise ContractError("external wait kind and identity are required")
         parse_timestamp(self.since, "wait.since")
+        if self.next_probe_at is not None:
+            parse_timestamp(self.next_probe_at, "wait.next_probe_at")
+        if self.evidence_path is not None and not Path(self.evidence_path).is_absolute():
+            raise ContractError("external wait evidence path must be absolute")
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         """返回稳定 JSON 表示。"""
         self.validate()
-        return {"kind": self.kind, "external_id": self.external_id, "since": self.since}
+        return {
+            "kind": self.kind,
+            "external_id": self.external_id,
+            "since": self.since,
+            "recovery_condition": self.recovery_condition,
+            "next_probe_at": self.next_probe_at,
+            "evidence_path": self.evidence_path,
+        }
 
 
 @dataclass(frozen=True)
@@ -334,6 +349,7 @@ def _migrate_v1(value: dict[str, Any], *, now: datetime, lease_ttl_sec: int) -> 
         # 只有 Q1/Q2 获得 grandfather；其余历史完成记录必须重新核验。
         "COMPLETED": QueueState.RECOVERY_REQUIRED,
         "BLOCKED": QueueState.BLOCKED,
+        "ABANDONED": QueueState.ABANDONED,
     }
     for legacy in value.get("questions", ()):
         number = question_number(legacy["question_id"])

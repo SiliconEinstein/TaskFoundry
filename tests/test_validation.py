@@ -298,7 +298,7 @@ def test_linear_session_rejects_changed_session_and_bad_digest() -> None:
 
 def test_linear_attempt_rejects_unknown_schema_and_missing_identity() -> None:
     with pytest.raises(ContractError, match="unsupported"):
-        replace(attempt(1), schema_version=4).validate()
+        replace(attempt(1), schema_version=5).validate()
     with pytest.raises(ContractError, match="validation session"):
         replace(attempt(1), schema_version=2).validate()
 

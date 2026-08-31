@@ -20,6 +20,28 @@ VALID_STAGES = frozenset({"outline", "author"})
 VALID_LEVELS = ("high", "medium", "low")
 SKILL_ATTRIBUTIONS = frozenset({"skill_noncompliance", "skill_knowledge_gap"})
 EVOLVABLE_FRONTIERS = frozenset({"informative", "boundary"})
+NON_EVOLVABLE_ATTRIBUTIONS = frozenset(
+    {
+        "platform_failure",
+        "environment_failure",
+        "harness_failure",
+        "resource_failure",
+        "verifier_failure",
+        "scientific_outcome",
+        "completed",
+        "abandoned_topic",
+    }
+)
+TERMINAL_OUTCOMES = frozenset(
+    {
+        "COMPLETED",
+        "TOO_EASY",
+        "SCIENTIFIC_REDESIGN_REQUIRED",
+        "ABANDONED_TOPIC",
+        "WAITING_EXTERNAL",
+        "DETERMINISTIC_FAILURE",
+    }
+)
 STAGE_INSTRUCTIONS = {
     "outline": (
         "在题号根目录中创建或替换且仅保留 QuestionDesignBrief.json 与 "
@@ -660,6 +682,57 @@ def record_skill_attribution(question: int, evidence_path: Path) -> Path:
     return target
 
 
+def record_revision_attribution(question: int, evidence_path: Path) -> dict[str, Any]:
+    """每个 revision 终态都记录 Teacher 归因，仅 Skill 责任进入演化池。"""
+    value = _read_object(evidence_path)
+    expected = {
+        "schema_version": 1,
+        "project_id": "question-from-questions",
+        "task_id": f"q{question}",
+        "role": "teacher",
+        "task_type": "method-selection",
+    }
+    if any(value.get(key) != expected_value for key, expected_value in expected.items()):
+        raise ContractError("revision attribution identity is invalid")
+    if value.get("terminal_outcome") not in TERMINAL_OUTCOMES:
+        raise ContractError("revision attribution terminal outcome is invalid")
+    revision = value.get("question_revision")
+    evidence_id = value.get("evidence_id")
+    attribution = value.get("attribution")
+    if not isinstance(revision, str) or not revision or not isinstance(evidence_id, str) or not evidence_id:
+        raise ContractError("revision attribution lacks revision or evidence identity")
+    eligible = attribution in SKILL_ATTRIBUTIONS
+    if attribution not in SKILL_ATTRIBUTIONS | NON_EVOLVABLE_ATTRIBUTIONS:
+        raise ContractError("revision attribution ownership is invalid")
+    if value.get("evolution_eligible") is not eligible:
+        raise ContractError("revision attribution evolution eligibility is inconsistent")
+    if eligible:
+        if value.get("frontier") not in EVOLVABLE_FRONTIERS:
+            raise ContractError("eligible revision attribution needs an evolvable frontier")
+        skill_path = record_skill_attribution(question, evidence_path)
+    else:
+        if value.get("frontier") is not None or value.get("signature") is not None:
+            raise ContractError("excluded revision attribution cannot propose a Skill lesson")
+        skill_path = None
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    identity = hashlib.sha256(encoded.encode()).hexdigest()
+    target = (
+        ensure_question_layout(question)
+        / "trace/authoring/revision-attributions"
+        / f"{identity}.json"
+    )
+    if target.exists():
+        if _read_object(target) != value:
+            raise ContractError("revision attribution digest collision")
+    else:
+        _write_object(target, value)
+    return {
+        "attribution_path": str(target),
+        "evolution_eligible": eligible,
+        "skill_attribution_path": str(skill_path) if skill_path else None,
+    }
+
+
 def reconcile_skill_batch(batch_id: str, questions: tuple[int, ...]) -> dict[str, Any]:
     """聚合同批题目证据，并确定性执行 SkillFoundry reconcile。"""
     _validate_batch_id(batch_id)
@@ -753,3 +826,40 @@ def evaluate_skill_candidate(plan_path: Path, verdict_path: Path) -> dict[str, A
         "--project-root",
         str(QUESTION_ROOT),
     ])
+
+
+def close_skill_batch(batch_id: str, questions: tuple[int, ...]) -> dict[str, Any]:
+    """终态批次自动 reconcile，并在三类评测齐备时自动 evaluate。"""
+    result = reconcile_skill_batch_if_ready(batch_id, questions)
+    lessons = result.get("lessons", [])
+    if not isinstance(lessons, list) or not lessons:
+        return result | {"evaluation_status": "NOT_REQUIRED"}
+    batch_root = QUESTION_ROOT / ".skillbank/evolution/batches" / batch_id
+    plan = batch_root / "evaluation-plan.json"
+    verdict = batch_root / "evaluation-verdict.json"
+    required = batch_root / "candidate-evaluation-required.json"
+    if not plan.is_file() or not verdict.is_file():
+        required_value = {
+            "schema_version": 1,
+            "batch_id": batch_id,
+            "status": "CANDIDATE_EVALUATION_REQUIRED",
+            "candidate_lesson_ids": [item.get("lesson_id") for item in lessons],
+            "required_gates": [
+                "original_failure_fixed",
+                "unseen_transfer_passed",
+                "frozen_regression_passed",
+            ],
+        }
+        if required.exists() and _read_object(required) != required_value:
+            raise ContractError("Skill candidate evaluation handoff drifted")
+        if not required.exists():
+            _write_object(required, required_value)
+        return result | {
+            "evaluation_status": "CANDIDATE_EVALUATION_REQUIRED",
+            "evaluation_handoff": str(required),
+        }
+    evaluated = evaluate_skill_candidate(plan, verdict)
+    return result | {
+        "evaluation_status": "EVALUATED",
+        "evaluation": evaluated,
+    }

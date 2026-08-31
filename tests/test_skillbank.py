@@ -422,6 +422,23 @@ def attributed_failure(question: int, evidence_id: str) -> dict[str, object]:
     }
 
 
+def revision_attribution(
+    question: int, evidence_id: str, attribution: str
+) -> dict[str, object]:
+    value = attributed_failure(question, evidence_id)
+    value.update(
+        schema_version=1,
+        question_revision="r1",
+        terminal_outcome="SCIENTIFIC_REDESIGN_REQUIRED",
+        evolution_eligible=attribution in skillbank.SKILL_ATTRIBUTIONS,
+        attribution=attribution,
+    )
+    if attribution not in skillbank.SKILL_ATTRIBUTIONS:
+        value["frontier"] = None
+        value["signature"] = None
+    return value
+
+
 def test_reconcile_skill_batch_clusters_two_normalized_attributions(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(skillbank, "QUESTION_ROOT", tmp_path)
     for question in (3, 4):
@@ -506,6 +523,60 @@ def test_attribution_rejects_platform_failure_as_skill_evolution(tmp_path: Path,
     write_json(source, value)
     with pytest.raises(ContractError, match="Skill-responsible"):
         skillbank.record_skill_attribution(3, source)
+
+
+def test_revision_attribution_records_all_outcomes_but_filters_evolution(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(skillbank, "QUESTION_ROOT", tmp_path)
+    platform = tmp_path / "platform.json"
+    write_json(platform, revision_attribution(3, "platform-1", "platform_failure"))
+
+    excluded = skillbank.record_revision_attribution(3, platform)
+
+    assert excluded["evolution_eligible"] is False
+    assert excluded["skill_attribution_path"] is None
+    assert Path(excluded["attribution_path"]).is_file()
+    assert not list((tmp_path / "3/trace/authoring/skill-attributions").glob("*.json"))
+
+    knowledge = tmp_path / "knowledge.json"
+    write_json(
+        knowledge,
+        revision_attribution(3, "knowledge-1", "skill_knowledge_gap"),
+    )
+    eligible = skillbank.record_revision_attribution(3, knowledge)
+    assert eligible["evolution_eligible"] is True
+    assert Path(str(eligible["skill_attribution_path"])).is_file()
+
+
+def test_close_skill_batch_hands_off_and_then_evaluates_candidate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(skillbank, "QUESTION_ROOT", tmp_path)
+    candidate = {
+        "patterns": [{"pattern_id": "sha256:p"}],
+        "lessons": [{"lesson_id": "sha256:l"}],
+    }
+    monkeypatch.setattr(
+        skillbank, "reconcile_skill_batch_if_ready", lambda *args: candidate
+    )
+
+    waiting = skillbank.close_skill_batch("batch-1", (3, 4))
+
+    assert waiting["evaluation_status"] == "CANDIDATE_EVALUATION_REQUIRED"
+    batch = tmp_path / ".skillbank/evolution/batches/batch-1"
+    write_json(batch / "evaluation-plan.json", {"schema_version": 1})
+    write_json(batch / "evaluation-verdict.json", {"schema_version": 1})
+    monkeypatch.setattr(
+        skillbank,
+        "evaluate_skill_candidate",
+        lambda plan, verdict: {"stable_advanced": True},
+    )
+
+    evaluated = skillbank.close_skill_batch("batch-1", (3, 4))
+
+    assert evaluated["evaluation_status"] == "EVALUATED"
+    assert evaluated["evaluation"]["stable_advanced"] is True
 
 
 def test_attribution_is_idempotent_and_rejects_wrong_frontier_or_signature(tmp_path: Path, monkeypatch) -> None:

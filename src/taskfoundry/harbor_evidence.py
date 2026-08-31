@@ -249,7 +249,7 @@ class HarborEvidenceImporter:
         request_path = request_dir / "request.json"
         capability_path = request_dir / "capability.json"
         request = ResearcherRequest.from_dict(_read_object(request_path))
-        if request.request_id != request_id or request.schema_version != 3:
+        if request.request_id != request_id or request.schema_version not in {3, 4}:
             raise HarborEvidenceError(
                 "persistent request identity or schema is invalid"
             )

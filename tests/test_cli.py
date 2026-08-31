@@ -15,6 +15,7 @@ from taskfoundry.labwright import ArtifactIdentity, EnvironmentDeltaRequest, Fil
 from taskfoundry.labwright_runtime import artifact_identity_sha256
 from taskfoundry.model import Actor, RunState
 from taskfoundry.store import RunStore
+from taskfoundry.supervisor import AdvanceResult
 from taskfoundry.workflow import RunWorkflow, WorkflowError
 
 
@@ -44,6 +45,40 @@ def test_status_prints_snapshot(tmp_path, capsys) -> None:
     )
     assert main(["status", str(run)]) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "DESIGNING"
+
+
+def test_supervisor_cli_register_once_and_resume(tmp_path, capsys, monkeypatch) -> None:
+    run = tmp_path / "runs" / "q12-run"
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({
+        "question_id": "q12",
+        "run_dir": str(run.resolve()),
+        "package_path": str((tmp_path / "package").resolve()),
+        "job_config_path": str((tmp_path / "job.json").resolve()),
+        "runtime_path": str((tmp_path / "runtime.json").resolve()),
+        "env_file": str((tmp_path / ".env").resolve()),
+        "queue_root": str((tmp_path / "queue").resolve()),
+        "validation_session_id": "q12-r16-persistent-01",
+        "pass_threshold": 0.85,
+        "overall_timeout_sec": 7200,
+        "schema_version": 1,
+    }))
+    assert main(["supervisor-register", str(plan)]) == 0
+    assert json.loads(capsys.readouterr().out)["phase"] == "READY"
+
+    monkeypatch.setattr(
+        "taskfoundry.cli.CampaignSupervisor.run_once",
+        lambda self: (AdvanceResult("q12", "RUNNING", "WORKER_RUNNING"),),
+    )
+    assert main(["supervise", str(tmp_path / "runs"), "--once"]) == 0
+    assert json.loads(capsys.readouterr().out)["results"][0]["action"] == "WORKER_RUNNING"
+
+    monkeypatch.setattr(
+        "taskfoundry.cli.CampaignSupervisor.resume",
+        lambda self, question_id: AdvanceResult(question_id, "READY", "RESUMED"),
+    )
+    assert main(["supervisor-resume", str(tmp_path / "runs"), "q12"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "RESUMED"
 
 
 def test_cli_direct_validation_cannot_skip_teacher_skill_contract(tmp_path, capsys) -> None:

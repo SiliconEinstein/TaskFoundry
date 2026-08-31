@@ -176,16 +176,53 @@ def test_waiting_external_releases_slot_and_resume_reenters_queue(tmp_path: Path
         kind="HARBOR",
         external_id="job-3",
         phase="FRESH_BLIND",
+        recovery_condition="provider health probe succeeds",
+        next_probe_at="2026-08-26T12:15:00+00:00",
+        evidence_path=tmp_path / "probe.json",
     )
     states = {item.question_id: item.state for item in waiting.snapshot.questions}
     assert waiting.released == ("q3",)
     assert waiting.activated == ("q6",)
     assert states["q3"] is QueueState.WAITING_EXTERNAL
     assert states["q6"] is QueueState.LEASED
+    waiting_item = next(
+        item for item in waiting.snapshot.questions if item.question_id == "q3"
+    )
+    assert waiting_item.wait is not None
+    assert waiting_item.wait.recovery_condition == "provider health probe succeeds"
+    assert waiting_item.wait.evidence_path == str((tmp_path / "probe.json").resolve())
 
     resumed = scheduler.resume_external("q3", external_id="job-3")
     assert next(item for item in resumed.snapshot.questions if item.question_id == "q3").state is QueueState.READY
     assert resumed.activated == ()
+
+
+def test_topic_abandonment_releases_slot_and_cannot_be_requeued(tmp_path: Path) -> None:
+    scheduler = QuestionScheduler(tmp_path / "scheduler")
+    scheduler.configure(max_active=2)
+    _enqueue(scheduler, tmp_path, "q3")
+    _enqueue(scheduler, tmp_path, "q4")
+    _enqueue(scheduler, tmp_path, "q5")
+    q3 = next(item for item in scheduler.snapshot().questions if item.question_id == "q3")
+    assert q3.lease is not None
+    evidence = tmp_path / "abandon.json"
+    evidence.write_text('{"reason":"scientific design cannot satisfy contract"}\n')
+
+    result = scheduler.abandon_topic(
+        "q3",
+        owner_id=q3.lease.owner_id,
+        lease_id=q3.lease.lease_id,
+        generation=q3.generation,
+        evidence_path=evidence,
+    )
+
+    abandoned = next(
+        item for item in result.snapshot.questions if item.question_id == "q3"
+    )
+    assert abandoned.state is QueueState.ABANDONED
+    assert result.released[0] == "q3"
+    with pytest.raises(ContractError, match="only recovery or blocked"):
+        scheduler.requeue("q3")
 
 
 def test_dispatch_claim_is_atomic_and_bound_to_lease(tmp_path: Path) -> None:

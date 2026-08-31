@@ -105,6 +105,16 @@ _MODEL_TRANSPORT_FAILURE_MARKERS = (
 )
 
 
+def runtime_researcher_identity(validation_session_id: str) -> str:
+    """返回 Supervisor 对持久 Harbor runtime 的确定性控制身份。"""
+    if not validation_session_id.strip() or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+        for character in validation_session_id
+    ):
+        raise ContractError("validation session identity is not safe")
+    return f"harbor-runtime:{validation_session_id}"
+
+
 @dataclass(frozen=True)
 class ResearcherRequest:
     """一次全新正式科学尝试的冻结请求。"""
@@ -135,13 +145,13 @@ class ResearcherRequest:
 
     def validate(self) -> None:
         """约束冻结字节、角色目标、正式模型和时间预算。"""
-        if self.schema_version not in {1, 2, 3}:
+        if self.schema_version not in {1, 2, 3, 4}:
             raise ContractError("unsupported Researcher request schema_version")
         if self.mode not in {"blind", "hint", "interactive"} or self.attempt_index < 1:
             raise ContractError("invalid Researcher attempt mode or index")
-        if self.schema_version != 3 and self.mode == "interactive":
-            raise ContractError("interactive mode requires request schema_version 3")
-        if self.schema_version == 3 and self.mode != "interactive":
+        if self.schema_version not in {3, 4} and self.mode == "interactive":
+            raise ContractError("interactive mode requires a persistent request schema")
+        if self.schema_version in {3, 4} and self.mode != "interactive":
             raise ContractError("persistent request must use interactive mode")
         if self.schema_version == 1 and self.mode == "blind" and self.context_digests:
             raise ContractError("blind attempts require empty context")
@@ -149,8 +159,12 @@ class ResearcherRequest:
             raise ContractError("hint attempts require reviewed context evidence")
         if self.schema_version == 2:
             self._validate_linear_session()
-        if self.schema_version == 3:
+        if self.schema_version in {3, 4}:
             self._validate_persistent_session()
+        if self.schema_version == 4 and self.researcher_thread_id != runtime_researcher_identity(
+            str(self.validation_session_id or "")
+        ):
+            raise ContractError("runtime-owned request has the wrong control identity")
         supported = {
             ("dsh", "deepseek-v4-pro"),
             ("codex", "deepseek-v4-pro-202606"),
@@ -392,7 +406,7 @@ class CapabilityStore:
         if actor is not Actor.TEACHER:
             raise ResearcherError("only Teacher may issue a Researcher request")
         request.validate()
-        if request.schema_version in {2, 3}:
+        if request.schema_version in {2, 3, 4}:
             for path in self.root.glob("*/request.json"):
                 try:
                     existing = json.loads(path.read_text(encoding="utf-8"))
@@ -411,7 +425,7 @@ class CapabilityStore:
                     and existing.get("validation_session_id")
                     == request.validation_session_id
                     and (
-                        request.schema_version == 3
+                        request.schema_version in {3, 4}
                         or existing.get("round_index") == request.round_index
                     )
                     and capability.get("status") != "REVOKED"
@@ -448,7 +462,7 @@ class CapabilityStore:
         if request.mode == "hint":
             context_paths.append(Path(str(request.approved_hint_path)).resolve())
         directory.mkdir(parents=True)
-        if request.schema_version == 3:
+        if request.schema_version in {3, 4}:
             controller_dir = (directory / "validation-control").resolve()
             try:
                 config["agents"][0]["kwargs"]["persistent_validation"][
@@ -546,6 +560,22 @@ class CapabilityStore:
             write_json(capability_path, capability)
             token_path.unlink()
             return request
+
+    def redeem_runtime(self, handoff: IssuedHandoff) -> ResearcherRequest:
+        """由 Supervisor 兑换 runtime-owned request，不依赖 Desktop task。"""
+        request_path = Path(handoff.request_path)
+        try:
+            request = ResearcherRequest.from_dict(
+                json.loads(request_path.read_text(encoding="utf-8"))
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ResearcherError("runtime-owned request cannot be read") from error
+        if request.schema_version != 4:
+            raise ResearcherError("only schema-v4 request is runtime-owned")
+        expected = runtime_researcher_identity(str(request.validation_session_id or ""))
+        if request.researcher_thread_id != expected:
+            raise ResearcherError("runtime-owned request identity is invalid")
+        return self.redeem(handoff, expected)
 
 
 def execute_harbor(
