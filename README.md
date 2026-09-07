@@ -30,6 +30,25 @@ TaskFoundry 是一套面向科研问题的题目生产与验证框架。它把�
 
 Skill 负责通用出题原则、质量底线和安全合同。领域知识、特定数据源和局部失败经验作为 Experience Card 进入 Bundle。每道题都记录实际使用的 Skill Bundle、稳定锁快照和输入哈希。
 
+这里的四个字段是一个联合选择键，不是四套互相叠加的 Skill：
+
+```text
+(role, task_type, stage, profile)
+                ↓
+        一个版本化 Skill Bundle
+```
+
+在当前实现中，下面两种组合都会解析到同一个 `method-selection-teacher` Bundle 的 v7，只是在 Bundle 内执行不同阶段的章节：
+
+```text
+teacher + method-selection + outline + multi-question-input
+teacher + method-selection + author  + multi-question-input
+```
+
+其中 `role` 表示执行职责，`task_type` 表示题型，`stage` 表示当前流程阶段，`profile` 表示输入材料的组织方式。它们不是四个独立目录，也不会把四份规范拼接在一起。`stable.lock` 决定当前实际使用的版本；历史 v1–v6 仅用于审计和回溯。
+
+当前已实现并作为稳定路径使用的是 Teacher 侧的 `method-selection`。`method-comparison`、`parameter-estimation` 等其他题型不能自动假定复用这套规则；它们应当建立各自的题型 Bundle，或明确登记兼容关系后再使用。Researcher 和 Reviewer 也不是 Teacher Skill 的别名：Researcher 只执行题面，Reviewer 只做独立审查，二者不能修改题包或替代 Teacher 评分。
+
 ### 3. 正式编题
 
 Author 依据已确认题纲构建最小可运行题包，通常包括 `instruction.md`、`environment/`、`resources.json`、`solution/`、`tests/` 和 `task.toml`。
@@ -47,6 +66,8 @@ Author 依据已确认题纲构建最小可运行题包，通常包括 `instruct
 三轮均未达到通过线时，才进入提示验证。提示由 Teacher 提供，不能直接泄露答案，并按里程碑顺序解除真正瓶颈。判断题目是否可解时，必须结合 trace，不能只看分数升降。
 
 平台、Harness、环境、资源传输和 verifier 启动失败属于非科学失败：保存证据、修复运行层并重试同一科学轮，不增加科学盲解计数，也不能把平台失败当成题目难度证据。
+
+盲解前后的职责边界如下：Teacher 冻结题包并发起任务；Researcher 在空上下文中解题并只提交规定输出；Harbor 负责沙盒、轨迹和提交回收；Teacher/Reviewer 读取轨迹和 verifier 结果后评分、归因和决定是否进入下一轮。Researcher 不读取私有答案、评分器或隐藏数据，也不能自行宣布“通过”。
 
 ### 5. 评分与难度迭代
 
@@ -68,6 +89,17 @@ question-pack/
 发布记录至少包括最终题包 SHA-256、`resources.json`、Skill Bundle 和 Experience Card 版本、Teacher/Researcher Profile、逐轮 Harbor trace、verifier 结果、失败归因以及最终难度版本。
 
 题号目录中的 `question-pack/` 只保存成功发布的版本；失败候选、实验输出和私有答案只能保存在 `trace/authoring/` 或受控运行目录。
+
+一次完整闭环的判定顺序是：
+
+```text
+输入 → outline → Skill resolve → author → 题包自检
+     → formal Reviewer → 冻结 revision → Harbor blind
+     → trace/score/归因 → 难度判断或提示
+     → 必要时新 revision → 最终发布
+```
+
+题包自检、Reviewer、环境探针和 Harbor blind 是不同层次的证据。前一层通过不等于后一层已经完成；平台失败也不等于科学题目失败。只有对应的 Harbor 结果、评分归因和发布封签齐全，题目才可进入 `question-pack/`。
 
 ## 二、可跨领域复用的部分
 
@@ -128,6 +160,8 @@ taskfoundry freeze-and-start-validation <run-dir> <package-dir> \
 ## 九、已知边界
 
 TaskFoundry 能严格约束应用层题包、状态机、输入校验和证据链，但不能把本地可写目录自动变成平台级不可伪造存储。平台网络、模型代理、LBG worker、镜像拉取和第三方资源可用性属于外部能力，必须与科学失败分开记录。
+
+README 中明确区分三种内容：已经实现并在稳定锁中生效的流程；为其他题型预留但尚未建立的扩展点；以及外部平台提供、项目本身无法保证的能力。没有稳定 Skill、正式题包、Reviewer 结论或 Harbor 证据的内容，只能视为候选或设计说明，不能视为已完成题目。
 
 ## 十、相关文档
 
