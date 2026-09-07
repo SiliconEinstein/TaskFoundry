@@ -20,7 +20,7 @@ description: 按 TaskFoundry 当前代码把一道人选题从大纲推进到可
 
 ## 1. 会话启动与知识冻结
 
-先确认题号、题型、Profile、当前 run 和是否已有恢复点。每一批开始前只执行一次 SkillFoundry resolve；outline 与 author 必须分别 resolve，并把返回的完整 Execution Skill、Bank Snapshot、Experience Cards 和 stable-lock 快照保存到：
+先确认题号、题型、Profile、当前 run 和是否已有恢复点。每一批开始前只执行一次 SkillFoundry resolve；outline 与 author 必须分别 resolve，并把返回的自包含 Skill Bundle、stable-lock 快照和任务输入保存到：
 
 ```text
 /personal/codex-workspace/question-from-questions/<N>/trace/authoring/skill-activations/
@@ -37,7 +37,7 @@ taskfoundry resolve-teacher-skill <N> author <attempt-id> \
   --batch-id <batch-id> --batch-question <N> [--task-input <input>]
 ```
 
-若 resolve 失败，状态是阻塞，不得绕过摘要、手改 stable lock 或继续写题。
+若 resolve 失败，状态是阻塞，不得绕过 bundle 哈希、手改 stable lock 或继续写题。
 
 ## 2. Outline 阶段
 
@@ -228,7 +228,7 @@ taskfoundry close-skill-batch <batch-id> --question <N>
 taskfoundry evaluate-skill-candidate <plan.json> <verdict.json>
 ```
 
-评测通过后由 SkillFoundry 更新 stable.lock；运行中的 batch 不得换版本，下一批才重新 resolve。
+评测通过后由 SkillFoundry 更新 stable.lock；运行中的 batch 不得换版本，下一批才重新 resolve。Skill Bundle 必须自包含，不能通过外部 RULE_SOURCES 或固定项目路径补齐规范。
 
 ## 9. 中断恢复硬规则
 
@@ -241,7 +241,7 @@ taskfoundry evaluate-skill-candidate <plan.json> <verdict.json>
 在报告“题目完成”前逐项核对并保存清单：
 
 ```text
-[ ] outline/author Skill activation 与 stable-lock 摘要已保存
+[ ] outline/author Skill Bundle activation 与 stable-lock 摘要已保存
 [ ] QuestionDesignBrief.json + .md 恰好两份且为最新版
 [ ] 题型是真正方法选择，存在异构方法族和未见工况迁移
 [ ] 公开干扰信息不能查表恢复标签

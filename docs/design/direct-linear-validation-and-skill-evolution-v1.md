@@ -25,7 +25,7 @@ outline Skill -> QuestionDesignBrief -> author Skill -> AUTHORING
 
 ## Skill Bank
 
-每道题在 `outline` 和 `author` 开工前分别执行一次 `skillfoundry resolve`。一次 activation 必须完整包含 Execution Skill、规则来源、Bank Snapshot、Experience Cards、任务输入和最终 prompt。首次 resolve 原子冻结 `batch_questions`、stable generation 和 stable-lock 摘要；同批各题及两个阶段均不得漂移。
+每道题在 `outline` 和 `author` 开工前分别执行一次 `skillfoundry resolve`。一次 activation 必须完整包含自包含 Skill Bundle、任务输入和最终 prompt；兼容旧版本时才允许加载历史规则来源。首次 resolve 原子冻结 `batch_questions`、stable generation 和 stable-lock 摘要；同批各题及两个阶段均不得漂移。
 
 每批结束后只聚合明确归因为 `skill_noncompliance` 或 `skill_knowledge_gap` 且位于 informative/boundary 区间的失败。至少两个不同题目的同机制证据才可 reconcile。候选必须同时通过原失败修复、未见任务迁移和冻结回归，才允许由 SkillFoundry 原子更新 `stable.lock`。
 

@@ -213,6 +213,18 @@ def validate_latest_brief(question: int) -> tuple[Path, Path]:
 
 
 def _verify_rule_sources(skill_path: Path) -> None:
+    bundle_manifest = skill_path / "MANIFEST.json"
+    if bundle_manifest.is_file() and not bundle_manifest.is_symlink():
+        manifest = _read_object(bundle_manifest)
+        if manifest.get("schema_version") != 2 or manifest.get("external_references") != []:
+            raise ContractError("self-contained Skill Bundle manifest is invalid")
+        for item in manifest.get("documents", ()):
+            if not isinstance(item, dict) or set(item) != {"path", "kind"}:
+                raise ContractError("self-contained Skill Bundle document entry is invalid")
+            document = skill_path / str(item["path"])
+            if document.is_symlink() or not document.is_file():
+                raise ContractError(f"self-contained Skill Bundle document is missing: {document}")
+        return
     manifest = _read_object(skill_path / "RULE_SOURCES.json")
     sources = manifest.get("sources")
     if manifest.get("schema_version") != 1 or not isinstance(sources, list) or not sources:
@@ -273,9 +285,9 @@ def _validate_activation_selection(
     skills = value.get("execution_skills")
     banks = value.get("experience_banks")
     cards = value.get("retrieved_cards")
-    if not isinstance(skills, list) or len(skills) != 1 or not isinstance(banks, list) or len(banks) != 1:
-        raise ContractError("activation must select one complete method-selection Skill and Bank")
-    if skills[0].get("artifact_id") != "method-selection-teacher" or banks[0].get("artifact_id") != "method-selection":
+    if not isinstance(skills, list) or len(skills) != 1 or not isinstance(banks, list):
+        raise ContractError("activation must select one complete method-selection Skill")
+    if skills[0].get("artifact_id") != "method-selection-teacher":
         raise ContractError("activation selected the wrong question-type knowledge")
     if not isinstance(cards, list):
         raise ContractError("activation Experience Cards must be explicit")
@@ -283,7 +295,11 @@ def _validate_activation_selection(
         "outline": {"method-selection-contract"},
         "author": {"public-family-fingerprint", "grader-fail-closed"},
     }
-    if {item.get("card_id") for item in cards if isinstance(item, dict)} != expected_cards[stage]:
+    if banks and banks[0].get("artifact_id") != "method-selection":
+        raise ContractError("activation selected the wrong question-type Bank")
+    allowed_bundle = not banks
+    actual_cards = {item.get("card_id") for item in cards if isinstance(item, dict)}
+    if (not allowed_bundle and actual_cards != expected_cards[stage]) or (allowed_bundle and actual_cards):
         raise ContractError("activation selected the wrong stage Experience Cards")
     return skills, cards
 
@@ -300,15 +316,13 @@ def _validate_loaded_documents(value: dict[str, Any], card_count: int) -> list[A
         if not isinstance(content, str) or _sha256_bytes(content.encode("utf-8")) != document["sha256"]:
             raise ContractError("loaded knowledge document digest is invalid")
         kinds.append(str(document["kind"]))
-    required_kinds = {
-        "execution_skill",
-        "rule_source_manifest",
-        "rule_source",
-        "experience_bank_snapshot",
-        "experience_card",
-    }
-    if not required_kinds <= set(kinds) or kinds.count("experience_card") != card_count:
-        raise ContractError("activation does not contain the complete resolved knowledge bundle")
+    if "skill_bundle_manifest" in kinds:
+        if "execution_skill" not in kinds or "experience_cards" not in kinds:
+            raise ContractError("self-contained Skill Bundle is incomplete")
+    else:
+        required_kinds = {"execution_skill", "rule_source_manifest", "rule_source", "experience_bank_snapshot", "experience_card"}
+        if not required_kinds <= set(kinds) or kinds.count("experience_card") != card_count:
+            raise ContractError("activation does not contain the complete resolved knowledge bundle")
     return documents
 
 

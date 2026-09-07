@@ -15,7 +15,7 @@ stage=outline | author
 profile=multi-question-input
 ```
 
-SkillFoundry 必须加载并哈希完整稳定版 Execution Skill、`RULE_SOURCES.json` 及每份规则原文、冻结 Bank Snapshot、本阶段 Experience Cards、显式任务输入和阶段指令，并把这些字节渲染成一个确定性 prompt。
+SkillFoundry 必须加载并哈希完整稳定版自包含 Skill Bundle、Bundle manifest、内嵌经验卡、显式任务输入和阶段指令，并把这些字节渲染成一个确定性 prompt。运行时不得依赖 Bundle 之外的规则文件。
 
 TaskFoundry 在题号目录中保存：
 
