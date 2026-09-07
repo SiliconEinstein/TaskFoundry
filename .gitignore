@@ -10,9 +10,12 @@ archive/
 archives/
 workbench/
 harbor-queue/
+harbor-queue.json
+harbor-queue.lock
 scheduler/
 smoke/harbor-jobs/
 labwright-service/checkpoint*.json
 labwright-service/*-shared-checkpoint.json
+q08-r14-candidate/
 dist/
 *.egg-info/

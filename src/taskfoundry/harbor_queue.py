@@ -239,6 +239,52 @@ class HarborJobQueue:
             self._write(replace(current, sequence=current.sequence + 1, jobs=tuple(jobs)))
             return completed
 
+    def reclaim_stale(
+        self,
+        request_id: str,
+        *,
+        claim_id: str,
+        stale_after_sec: int,
+        evidence_path: Path,
+    ) -> HarborQueueEntry:
+        """Return an abandoned ACTIVE claim to WAITING, never to a result state.
+
+        Reclamation is deliberately explicit: callers must preserve a readable
+        interruption record and prove the lease age.  A stale claim cannot be
+        silently overwritten or counted as a scientific attempt.
+        """
+        if stale_after_sec < 1 or not evidence_path.is_file():
+            raise ContractError("stale reclaim requires a positive age and evidence file")
+        try:
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ContractError("stale reclaim evidence must be valid JSON") from exc
+        if not isinstance(evidence, dict) or evidence.get("request_id") != request_id:
+            raise ContractError("stale reclaim evidence does not bind the request")
+        with self._locked():
+            current = self.snapshot()
+            index = next((i for i, item in enumerate(current.jobs) if item.request_id == request_id), None)
+            if index is None:
+                raise ContractError("Harbor request is not queued")
+            item = current.jobs[index]
+            if item.state is not HarborQueueState.ACTIVE or item.claim_id != claim_id:
+                raise ContractError("Harbor claim is stale or unavailable")
+            updated_at = datetime.fromisoformat(item.updated_at)
+            age = (datetime.now(UTC) - updated_at).total_seconds()
+            if age < stale_after_sec:
+                raise ContractError("Harbor claim has not exceeded stale lease age")
+            reclaimed = replace(
+                item,
+                state=HarborQueueState.WAITING,
+                claim_id=None,
+                worker_id=None,
+                updated_at=datetime.now(UTC).isoformat(),
+            )
+            jobs = list(current.jobs)
+            jobs[index] = reclaimed
+            self._write(replace(current, sequence=current.sequence + 1, jobs=tuple(jobs)))
+            return reclaimed
+
     def authorize(self, request_id: str, *, claim_id: str, job_config_path: Path) -> HarborQueueEntry:
         """确认正式 Researcher 只执行已经取得全局槽位的精确 JobConfig。"""
         resolved = str(job_config_path.resolve())

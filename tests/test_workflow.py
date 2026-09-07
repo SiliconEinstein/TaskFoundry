@@ -798,6 +798,19 @@ def test_workflow_issues_one_schema3_request_for_persistent_harbor_session(
         == request.controller_dir
     )
     assert frozen["extra_instruction_paths"] == []
+    with pytest.raises(WorkflowError, match="round already has"):
+        flow.issue_researcher_request(
+            Actor.TEACHER,
+            request_id="persistent-request-2-blocked",
+            job_config_path=config,
+        )
+    retry = flow.issue_researcher_request(
+        Actor.TEACHER,
+        request_id="persistent-request-2-retry",
+        job_config_path=config,
+        closed_request_ids=("persistent-request-1",),
+    )
+    assert Path(retry.request_path).parent.name == "persistent-request-2-retry"
 
 
 def test_workflow_uses_runtime_owned_researcher_without_desktop_thread(
@@ -1542,7 +1555,7 @@ def test_direct_validation_requires_runtime_finalization_before_completion(
         receipt(tmp_path, closure),
         "direct-runtime-environment",
     )
-    assert completed.state is RunState.COMPLETED
+    assert completed.state is RunState.PUBLICATION_PENDING
 
 
 def test_direct_start_rejects_missing_session_identity_or_bad_package(tmp_path) -> None:

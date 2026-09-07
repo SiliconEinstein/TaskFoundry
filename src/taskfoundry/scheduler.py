@@ -278,6 +278,8 @@ class QuestionScheduler:
             current = self.snapshot()
             item = self._item(current, question_id)
             now = self._now()
+            # Publication-pending keeps its lease until the final atomic bind;
+            # expiry or fencing mismatch must therefore fail closed.
             self._require_lease(item, owner_id, lease_id, generation, now=now)
             waiting = replace(
                 item,
@@ -381,7 +383,7 @@ class QuestionScheduler:
             if not item.run_dir:
                 raise ContractError("scheduled question has no run directory")
             run = RunStore(Path(item.run_dir)).read_snapshot()
-            if run is None or run.state is not RunState.COMPLETED:
+            if run is None or run.state not in {RunState.COMPLETED, RunState.PUBLICATION_PENDING}:
                 raise ContractError("published family can only bind to a completed run")
             sealed_trace = _default_finalize_published_family(number, resolved_family, run)
             if not sealed_trace.is_dir() or sealed_trace.is_symlink():
@@ -444,9 +446,15 @@ class QuestionScheduler:
                 continue
             synchronized = self._sync_run(item, now)
             questions[index] = synchronized
-            if synchronized.state is not QueueState.LEASED:
+            if synchronized.state not in {
+                QueueState.LEASED,
+                QueueState.PUBLICATION_PENDING,
+            }:
                 released.append(item.question_id)
-        occupied = sum(item.state is QueueState.LEASED for item in questions)
+        occupied = sum(
+            item.state in {QueueState.LEASED, QueueState.PUBLICATION_PENDING}
+            for item in questions
+        )
         owners = {item.lease.owner_id for item in questions if item.lease}
         activated: list[str] = []
         for index, item in enumerate(questions):
@@ -488,9 +496,10 @@ class QuestionScheduler:
         run = RunStore(Path(item.run_dir)).read_snapshot()
         if run is None:
             return replace(item, state=QueueState.RECOVERY_REQUIRED, lease=None, updated_at=now.isoformat())
-        if run.state is RunState.COMPLETED:
+        if run.state in {RunState.COMPLETED, RunState.PUBLICATION_PENDING}:
             return replace(
                 item,
+                state=QueueState.PUBLICATION_PENDING,
                 phase="RUN_COMPLETED_AWAITING_PUBLICATION",
                 last_run_state=run.state.value,
                 updated_at=now.isoformat(),
@@ -541,7 +550,7 @@ class QuestionScheduler:
     ) -> TeacherLease:
         lease = item.lease
         if (
-            item.state is not QueueState.LEASED
+            item.state not in {QueueState.LEASED, QueueState.PUBLICATION_PENDING}
             or not lease
             or lease.owner_id != owner_id
             or lease.lease_id != lease_id

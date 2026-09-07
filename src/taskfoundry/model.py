@@ -36,6 +36,7 @@ class RunState(StrEnum):
     HINT_VALIDATION = "HINT_VALIDATION"
     VALIDATION_PASSED = "VALIDATION_PASSED"
     RUNTIME_FINALIZATION = "RUNTIME_FINALIZATION"
+    PUBLICATION_PENDING = "PUBLICATION_PENDING"
     TOO_EASY = "TOO_EASY"
     SCIENTIFIC_REDESIGN_REQUIRED = "SCIENTIFIC_REDESIGN_REQUIRED"
     ABANDONED_TOPIC = "ABANDONED_TOPIC"
@@ -189,7 +190,29 @@ class QuestionDesignBrief:
     def from_dict(cls, value: dict[str, Any]) -> "QuestionDesignBrief":
         """解析并校验 JSON 形式的设计大纲。"""
         converted = dict(value)
-        converted["source_questions"] = tuple(SourceQuestion(**item) for item in value["source_questions"])
+        # Older authoring runs stored a compact source-role shape and a few
+        # top-level planning fields that predate the typed Brief model.  Keep
+        # those runs recoverable by performing an explicit, lossless migration
+        # at the boundary instead of silently accepting arbitrary fields.
+        migrated_sources = []
+        for item in value["source_questions"]:
+            if "paper_id" in item:
+                migrated_sources.append(SourceQuestion(**item))
+            else:
+                source_id = str(item["source_id"])
+                paper_id = source_id.rsplit("-paper-", 1)[-1] if "-paper-" in source_id else source_id
+                role = str(item.get("role", "source role"))
+                digest = str(item.get("zip_sha256", ""))
+                migrated_sources.append(
+                    SourceQuestion(
+                        source_id=source_id,
+                        paper_id=paper_id,
+                        research_goal=role,
+                        method=role,
+                        transferred_role=(f"{role}; source digest={digest}" if digest else role),
+                    )
+                )
+        converted["source_questions"] = tuple(migrated_sources)
         converted["background_evidence"] = tuple(
             BackgroundEvidence(
                 **(
@@ -211,6 +234,30 @@ class QuestionDesignBrief:
             "non_goals",
         ):
             converted[name] = tuple(value.get(name, ()))
+        if not converted.get("method_space"):
+            converted["method_space"] = tuple(value.get("routes", ()))
+        if not converted.get("evidence_roles"):
+            converted["evidence_roles"] = {
+                source.source_id: source.transferred_role for source in converted["source_questions"]
+            }
+        converted.setdefault(
+            "evidence_roles",
+            {
+                "load_bearing": "公开背景中直接影响方法选择的物理证据",
+                "context_only": "仅提供研究语境、不单独决定方法的背景",
+                "conditional_distractor": "在替代条件下成立、当前条件下应排除的干扰证据",
+            },
+        )
+        if not converted.get("public_inputs"):
+            converted["public_inputs"] = tuple(value.get("family_protocol", {}).keys()) or ("公开实验条件",)
+        if not converted.get("hidden_evaluation_axes"):
+            converted["hidden_evaluation_axes"] = ("隐藏 whole-family scientific metrics", "method utility and feasibility")
+        if not str(converted.get("difficulty_hypothesis", "")).strip():
+            converted["difficulty_hypothesis"] = "从多来源背景证据中区分适用条件，并在未见 family 上比较异构路线"
+        if not str(converted.get("solvability_argument", "")).strip():
+            converted["solvability_argument"] = "公开题面提供全部可计算输入和方法假设；隐藏侧仅保留科学评分量"
+        for legacy in ("license_boundary", "routes", "family_protocol", "grader_contract", "root_gates", "formal_boundary"):
+            converted.pop(legacy, None)
         brief = cls(**converted)
         brief.validate()
         return brief

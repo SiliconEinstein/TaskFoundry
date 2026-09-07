@@ -100,12 +100,17 @@ class CampaignSupervisor:
                 and circuit.state is not CircuitState.CLOSED
             ):
                 raise ContractError("model transport circuit has not recovered")
+            persistent_continuation = self._is_persistent_continuation(current)
             next_snapshot = replace(
                 current,
-                phase=SupervisorPhase.READY,
+                phase=(
+                    SupervisorPhase.RETRY_SCHEDULED
+                    if persistent_continuation
+                    else SupervisorPhase.READY
+                ),
                 sequence=current.sequence + 1,
                 updated_at=self._now(),
-                next_action_at=None,
+                next_action_at=self._now() if persistent_continuation else None,
                 recovery_condition=None,
                 process_id=None,
                 process_started_at=None,
@@ -119,9 +124,15 @@ class CampaignSupervisor:
         with store.locked():
             current = store.read_unlocked()
             if current.phase is SupervisorPhase.READY:
+                if self._is_persistent_continuation(current):
+                    return self._retry_persistent_continuation(plan, store, current)
                 return self._launch(plan, store, current)
             if current.phase is SupervisorPhase.RETRY_SCHEDULED:
                 if parse_time(str(current.next_action_at)) <= self.clock():
+                    if self._is_persistent_continuation(current):
+                        return self._retry_persistent_continuation(
+                            plan, store, current
+                        )
                     return self._launch(plan, store, current)
                 return AdvanceResult(plan.question_id, current.phase.value, "WAIT_RETRY")
             if current.phase is SupervisorPhase.RUNNING:
@@ -156,6 +167,7 @@ class CampaignSupervisor:
             Actor.TEACHER,
             request_id=request_id,
             job_config_path=config_path,
+            closed_request_ids=self._closed_request_ids_for_retry(plan, current),
         )
         handoff_path = Path(handoff.request_path).parent / "handoff.json"
         atomic_json(handoff_path, asdict(handoff))
@@ -274,12 +286,29 @@ class CampaignSupervisor:
             hint=value.get("hint"),
             teacher_declares_non_answer=value.get("teacher_declares_non_answer"),
         )
+        worker_alive = self.processes.alive(int(current.process_id or 0))
         RunWorkflow(RunStore(Path(plan.run_dir))).decide_persistent_validation_round(
             Actor.TEACHER,
             request_id=str(current.request_id),
             round_index=current.scientific_round,
             decision=decision,
         )
+        process_id = current.process_id
+        process_started_at = current.process_started_at
+        action = "TEACHER_ACTION_APPLIED"
+        if not worker_alive and decision.action == "CONTINUE_HINT":
+            command = self._persistent_recovery_command(
+                plan, current, action_path
+            )
+            request_dir = Path(str(current.handoff_path)).parent
+            process_id = self.processes.launch(
+                command,
+                cwd=Path(plan.run_dir),
+                stdout_path=request_dir / "persistent-recovery.stdout.log",
+                stderr_path=request_dir / "persistent-recovery.stderr.log",
+            )
+            process_started_at = self._now()
+            action = "TEACHER_ACTION_APPLIED_RECOVERY"
         next_snapshot = replace(
             current,
             phase=SupervisorPhase.RUNNING,
@@ -287,9 +316,120 @@ class CampaignSupervisor:
             updated_at=self._now(),
             last_decided_round=current.scientific_round,
             scientific_round=current.scientific_round + 1,
+            process_id=process_id,
+            process_started_at=process_started_at,
         )
         state_store.write_unlocked(next_snapshot)
-        return AdvanceResult(plan.question_id, next_snapshot.phase.value, "TEACHER_ACTION_APPLIED")
+        return AdvanceResult(plan.question_id, next_snapshot.phase.value, action)
+
+    def _persistent_recovery_command(
+        self,
+        plan: SupervisorPlan,
+        current: SupervisorSnapshot,
+        action_path: Path,
+    ) -> list[str]:
+        """Build the bound continuation worker for a dead local Harbor owner."""
+        if current.request_id is None or current.receipt_path is None:
+            raise ContractError("persistent recovery lacks request or receipt identity")
+        runtime = read_object(Path(plan.runtime_path))
+        adapter_paths = str(runtime.get("adapter_pythonpath") or "").split(os.pathsep)
+        harbor_roots = [Path(path).parent for path in adapter_paths if path.endswith("/harbor-lbg/src")]
+        recovery_python = (
+            harbor_roots[0] / ".venv/bin/python" if harbor_roots else Path(sys.executable)
+        )
+        if not recovery_python.is_file():
+            raise ContractError("persistent recovery Harbor interpreter is unavailable")
+        return [
+            str(recovery_python),
+            "-m",
+            "taskfoundry.persistent_recovery",
+            "--run-dir",
+            plan.run_dir,
+            "--request-id",
+            current.request_id,
+            "--runtime",
+            plan.runtime_path,
+            "--env-file",
+            plan.env_file,
+            "--teacher-action",
+            str(action_path.resolve()),
+            "--receipt",
+            current.receipt_path,
+        ]
+
+    def _is_persistent_continuation(self, current: SupervisorSnapshot) -> bool:
+        if current.scientific_round < 4 or current.handoff_path is None:
+            return False
+        request_dir = Path(current.handoff_path).parent
+        decision = request_dir / "validation-control/round-03-decision.json"
+        return (
+            decision.is_file()
+            and read_object(decision).get("action") == "CONTINUE_HINT"
+            and not Path(str(current.receipt_path)).exists()
+        )
+
+    def _retry_persistent_continuation(
+        self,
+        plan: SupervisorPlan,
+        state_store: SupervisorStateStore,
+        current: SupervisorSnapshot,
+    ) -> AdvanceResult:
+        self._archive_platform_round_result(plan, current)
+        action_path = Path(plan.run_dir) / "supervisor/teacher-action.json"
+        command = self._persistent_recovery_command(plan, current, action_path)
+        request_dir = Path(str(current.handoff_path)).parent
+        process_id = self.processes.launch(
+            command,
+            cwd=Path(plan.run_dir),
+            stdout_path=request_dir / "persistent-recovery.stdout.log",
+            stderr_path=request_dir / "persistent-recovery.stderr.log",
+        )
+        next_snapshot = replace(
+            current,
+            phase=SupervisorPhase.RUNNING,
+            sequence=current.sequence + 1,
+            updated_at=self._now(),
+            process_id=process_id,
+            process_started_at=self._now(),
+            next_action_at=None,
+            last_failure_stage=None,
+            recovery_condition=None,
+        )
+        state_store.write_unlocked(next_snapshot)
+        return AdvanceResult(
+            plan.question_id,
+            next_snapshot.phase.value,
+            "PERSISTENT_CONTINUATION_RETRIED",
+        )
+
+    def _archive_platform_round_result(
+        self, plan: SupervisorPlan, current: SupervisorSnapshot
+    ) -> None:
+        request_dir = Path(str(current.handoff_path)).parent
+        result_path = (
+            request_dir
+            / "validation-control"
+            / f"round-{current.scientific_round:02d}-result.json"
+        )
+        if not result_path.is_file():
+            return
+        value = read_object(result_path)
+        if value.get("classification") == "SCIENTIFIC_RESULT":
+            raise ContractError("scientific continuation result cannot be retried")
+        digest = file_sha256(result_path)
+        archive = (
+            Path(plan.run_dir)
+            / "supervisor"
+            / (
+                f"platform-round-{current.scientific_round:02d}-result-"
+                f"{digest[:12]}.json"
+            )
+        )
+        if archive.exists() and read_object(archive) != value:
+            raise ContractError("archived platform result drifted")
+        if not archive.exists():
+            atomic_json(archive, value)
+        result_path.unlink()
 
     def _finish_worker(
         self,
@@ -518,6 +658,28 @@ class CampaignSupervisor:
             atomic_json(output, value)
         return output
 
+    def _closed_request_ids_for_retry(
+        self, plan: SupervisorPlan, current: SupervisorSnapshot
+    ) -> tuple[str, ...]:
+        """Return every request durably closed by lost-worker recovery."""
+        if current.phase is not SupervisorPhase.RETRY_SCHEDULED:
+            return ()
+        request_ids: list[str] = []
+        supervisor_root = Path(plan.run_dir) / "supervisor"
+        for path in sorted(supervisor_root.glob("lost-worker-runtime-*.json")):
+            value = read_object(path)
+            request_id = value.get("request_id")
+            if (
+                value.get("question_id") == plan.question_id
+                and value.get("failure_stage") == "PLATFORM"
+                and isinstance(request_id, str)
+                and request_id
+            ):
+                request_ids.append(request_id)
+        if current.request_id is not None:
+            request_ids.append(current.request_id)
+        return tuple(dict.fromkeys(request_ids))
+
     def _worker_command(
         self, plan: SupervisorPlan, handoff_path: Path, receipt_path: Path
     ) -> list[str]:
@@ -548,9 +710,13 @@ class CampaignSupervisor:
     def _write_lost_worker_evidence(
         self, plan: SupervisorPlan, current: SupervisorSnapshot
     ) -> Path:
-        path = Path(plan.run_dir) / "supervisor" / (
-            f"lost-worker-runtime-{current.runtime_attempt:03d}.json"
+        filename = (
+            f"lost-continuation-round-{current.scientific_round:02d}-"
+            f"sequence-{current.sequence:03d}.json"
+            if self._is_persistent_continuation(current)
+            else f"lost-worker-runtime-{current.runtime_attempt:03d}.json"
         )
+        path = Path(plan.run_dir) / "supervisor" / filename
         value = {
             "schema_version": 1,
             "question_id": plan.question_id,

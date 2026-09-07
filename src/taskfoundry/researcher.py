@@ -577,6 +577,31 @@ class CapabilityStore:
             raise ResearcherError("runtime-owned request identity is invalid")
         return self.redeem(handoff, expected)
 
+    def redeem_platform_recovery(
+        self, handoff: IssuedHandoff, current_thread_id: str, evidence_path: Path
+    ) -> ResearcherRequest:
+        """Recover a consumed capability only after an attested platform failure.
+
+        This preserves one scientific request/attempt while permitting Harbor
+        infrastructure recovery; arbitrary or scientific failures are rejected.
+        """
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        if not isinstance(evidence, dict) or evidence.get("request_id") is None:
+            raise ResearcherError("platform recovery evidence is invalid")
+        request_path = Path(handoff.request_path)
+        request = ResearcherRequest.from_dict(json.loads(request_path.read_text(encoding="utf-8")))
+        if evidence.get("request_id") != request.request_id:
+            raise ResearcherError("platform recovery evidence binds another request")
+        if evidence.get("classification") != "PLATFORM_FAILURE" or evidence.get("scientific_attempt_counted") is not False:
+            raise ResearcherError("only non-scientific platform failures are recoverable")
+        capability = json.loads(Path(handoff.capability_path).read_text(encoding="utf-8"))
+        if capability.get("status") != "CONSUMED" or capability.get("consumed_by_thread_id") != current_thread_id:
+            raise ResearcherError("capability is not eligible for platform recovery")
+        if sha256_file(request_path) != capability.get("request_sha256"):
+            raise ResearcherError("Researcher request changed after issue")
+        validate_launch_contract(request)
+        return request
+
 
 def execute_harbor(
     *,
@@ -597,6 +622,10 @@ def execute_harbor(
     log_dir.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     adapter_pythonpath = runtime.adapter_pythonpath
+    harbor_source = "/personal/harbor-lbg/src"
+    if Path(harbor_source).is_dir():
+        existing = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = harbor_source + (os.pathsep + existing if existing else "")
     if adapter_pythonpath:
         existing_pythonpath = environment.get("PYTHONPATH", "")
         environment["PYTHONPATH"] = adapter_pythonpath + (

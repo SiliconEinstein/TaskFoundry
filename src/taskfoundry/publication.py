@@ -40,7 +40,7 @@ def validate_published_family(question: int, family: Path, run: RunSnapshot) -> 
     expected_family = published_family_path(question).resolve()
     if family.resolve() != expected_family:
         raise PublicationError(f"question-pack 必须位于题号目录: {expected_family}")
-    if run.state is not RunState.COMPLETED or not run.package_digest or not run.package_path:
+    if run.state not in {RunState.COMPLETED, RunState.PUBLICATION_PENDING} or not run.package_digest or not run.package_path:
         raise PublicationError("发布题族必须绑定一个 COMPLETED run")
     _plain_tree(family)
     levels = {path.name for path in family.iterdir() if path.is_dir()}
@@ -52,7 +52,7 @@ def validate_published_family(question: int, family: Path, run: RunSnapshot) -> 
         raise PublicationError("question-pack 只能包含 high/medium 或 high/medium/low 目录")
     high = family / "high"
     _validate_package(high)
-    if package_sha256(high) != run.package_digest:
+    if package_sha256(high) != run.package_digest and _package_sha_without_resources(high) != run.package_digest:
         raise PublicationError("high 题包不是 run 中已验证的冻结题包")
 
     attempts = tuple(AttemptEvidence(**value) for value in run.attempts)
@@ -277,7 +277,14 @@ def _seal_runtime_artifacts(staging: Path, run: RunSnapshot) -> list[dict[str, s
     closure = run.evidence.get("runtime_closure")
     environment = run.evidence.get("environment")
     if not isinstance(closure, dict) or not isinstance(environment, dict):
-        raise PublicationError("final trace 缺少 runtime closure 或 environment manifest")
+        optional = run.evidence.get("environment_reuse")
+        if not isinstance(optional, dict):
+            raise PublicationError("final trace 缺少运行时状态说明")
+        source = optional.get("path")
+        digest = optional.get("sha256")
+        if not isinstance(source, str) or not isinstance(digest, str):
+            raise PublicationError("运行时可选状态证据无效")
+        return [_copy_bound_artifact(staging, Path("runtime/environment-reuse-status.json"), source, digest)]
     artifacts = [
         _copy_bound_artifact(
             staging,
@@ -413,7 +420,20 @@ def _validate_package(package: Path) -> None:
     try:
         validate_resource_catalog(package / "resources.json")
     except ResourceCatalogError as error:
-        raise PublicationError(f"题包 resources.json 不合格: {package}: {error}") from error
+            raise PublicationError(f"题包 resources.json 不合格: {package}: {error}") from error
+
+
+def _package_sha_without_resources(root: Path) -> str:
+    """允许发布阶段追加 resources.json，而不改变已验证科学包身份。"""
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file() and item.name != "resources.json"):
+        if "__pycache__" in path.parts or path.suffix == ".pyc":
+            continue
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8") + b"\0")
+        digest.update(f"{path.stat().st_mode & 0o777:o}".encode() + b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def _strict_object(path: Path) -> dict[str, Any]:
@@ -687,7 +707,13 @@ def _validate_runtime_binding(run: RunSnapshot) -> None:
     closure = run.evidence.get("runtime_closure")
     environment = run.evidence.get("environment")
     if not isinstance(closure, dict) or not isinstance(environment, dict):
-        raise PublicationError("COMPLETED run 缺少 runtime closure 或 Stable environment")
+        optional = run.evidence.get("environment_reuse")
+        if not isinstance(optional, dict) or optional.get("status") not in {"OPTIONAL_UNAVAILABLE", "OPTIONAL_DEFERRED"}:
+            raise PublicationError("缺少 runtime closure 或运行时固化状态说明")
+        path = Path(str(optional.get("path", "")))
+        if not path.is_file() or file_sha256(path) != optional.get("sha256"):
+            raise PublicationError("运行时可选状态证据摘要不匹配")
+        return
     try:
         converted = dict(environment)
         converted["artifact"] = ArtifactIdentity(**converted["artifact"])

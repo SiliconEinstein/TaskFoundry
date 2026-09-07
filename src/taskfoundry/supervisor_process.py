@@ -30,6 +30,9 @@ class ProcessAdapter(Protocol):
 class LocalProcessAdapter:
     """Start a detached local controller whose child Harbor job is canonical."""
 
+    def __init__(self) -> None:
+        self._children: dict[int, subprocess.Popen[bytes]] = {}
+
     def launch(
         self,
         command: list[str],
@@ -56,21 +59,15 @@ class LocalProcessAdapter:
                 env=environment,
                 start_new_session=True,
             )
+        self._children[process.pid] = process
         return process.pid
 
     def alive(self, process_id: int) -> bool:
-        """Treat a zombie as stopped so missing receipts enter typed recovery."""
-        stat_path = Path(f"/proc/{process_id}/stat")
-        try:
-            fields = stat_path.read_text(encoding="utf-8").split()
-            if len(fields) > 2 and fields[2] == "Z":
-                return False
-        except OSError:
-            fields = []
-        try:
-            os.kill(process_id, 0)
-        except ProcessLookupError:
+        """Observe only a process handle launched by this adapter instance."""
+        process = self._children.get(process_id)
+        if process is None:
             return False
-        except PermissionError:
+        if process.poll() is None:
             return True
-        return True
+        self._children.pop(process_id, None)
+        return False

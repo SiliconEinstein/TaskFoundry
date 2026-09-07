@@ -124,6 +124,10 @@ def parser() -> argparse.ArgumentParser:
     direct.add_argument("--validation-session-id", required=True)
     direct.add_argument("--researcher-thread-id")
 
+    recover_session = commands.add_parser("recover-validation-session")
+    recover_session.add_argument("run_dir", type=Path)
+    recover_session.add_argument("request", type=Path)
+
     record_round = commands.add_parser("record-validation-round")
     record_round.add_argument("run_dir", type=Path)
     record_round.add_argument("request_id")
@@ -144,6 +148,12 @@ def parser() -> argparse.ArgumentParser:
     )
     decide_round.add_argument("--hint")
     decide_round.add_argument("--teacher-declares-non-answer", action="store_true")
+
+    direct_decide = commands.add_parser("decide-validation-round")
+    direct_decide.add_argument("run_dir", type=Path)
+    direct_decide.add_argument("request_id")
+    direct_decide.add_argument("action", choices=["CONTINUE_BLIND", "CONTINUE_HINT", "STOP_TOO_EASY", "STOP_PASSED", "STOP_BLOCKED"])
+    direct_decide.add_argument("--hint", type=Path)
 
     record_session = commands.add_parser("record-persistent-validation-session")
     record_session.add_argument("run_dir", type=Path)
@@ -172,6 +182,10 @@ def parser() -> argparse.ArgumentParser:
     runtime_finalization = commands.add_parser("begin-runtime-finalization")
     runtime_finalization.add_argument("run_dir", type=Path)
 
+    complete_optional_runtime = commands.add_parser("complete-without-runtime-environment")
+    complete_optional_runtime.add_argument("run_dir", type=Path)
+    complete_optional_runtime.add_argument("evidence", type=Path)
+
     bind_environment = commands.add_parser("bind-runtime-environment")
     bind_environment.add_argument("run_dir", type=Path)
     bind_environment.add_argument("receipt", type=Path)
@@ -195,6 +209,7 @@ def parser() -> argparse.ArgumentParser:
     issue.add_argument("request_id")
     issue.add_argument("job_config", type=Path)
     issue.add_argument("--approved-hint", type=Path)
+    issue.add_argument("--closed-request-id", action="append", default=[])
 
     revoke = commands.add_parser("revoke-researcher")
     revoke.add_argument("handoff", type=Path)
@@ -215,6 +230,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--overall-timeout-sec", type=int, default=7200)
     run.add_argument("--queue-root", type=Path, required=True)
     run.add_argument("--claim-id")
+    run.add_argument("--recovery-evidence", type=Path)
 
     runtime_run = commands.add_parser("runtime-researcher-run")
     runtime_run.add_argument("handoff", type=Path)
@@ -260,6 +276,13 @@ def parser() -> argparse.ArgumentParser:
         choices=["COMPLETED", "PLATFORM_FAILED", "RECOVERY_REQUIRED"],
         required=True,
     )
+
+    harbor_queue_reclaim = commands.add_parser("harbor-queue-reclaim-stale")
+    harbor_queue_reclaim.add_argument("queue_root", type=Path)
+    harbor_queue_reclaim.add_argument("request_id")
+    harbor_queue_reclaim.add_argument("--claim-id", required=True)
+    harbor_queue_reclaim.add_argument("--stale-after-sec", type=int, required=True)
+    harbor_queue_reclaim.add_argument("--evidence", type=Path, required=True)
 
     _add_scheduler_parsers(commands)
 
@@ -354,7 +377,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "close-skill-batch": _close_skill_batch,
         "evaluate-skill-candidate": _evaluate_skill_candidate,
         "freeze-and-start-validation": _freeze_and_start_validation,
+        "recover-validation-session": _recover_validation_session,
         "record-validation-round": _record_validation_round,
+        "decide-validation-round": _decide_validation_round,
         "decide-persistent-validation-round": _decide_persistent_validation_round,
         "record-persistent-validation-session": _record_persistent_validation_session,
         "repair-validation-history-delivery": _repair_validation_history_delivery,
@@ -363,6 +388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "accept-runtime-delta": _accept_runtime_delta,
         "accept-runtime-closure": _accept_runtime_closure,
         "begin-runtime-finalization": _begin_runtime_finalization,
+        "complete-without-runtime-environment": _complete_without_runtime_environment,
         "bind-runtime-environment": _bind_runtime_environment,
         "import-environment": _import_environment,
         "build-harbor-config": _build_harbor,
@@ -378,6 +404,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "harbor-queue-submit": _harbor_queue_submit,
         "harbor-queue-claim": _harbor_queue_claim,
         "harbor-queue-complete": _harbor_queue_complete,
+        "harbor-queue-reclaim-stale": _harbor_queue_reclaim_stale,
         "scheduler-status": _scheduler_status,
         "scheduler-enqueue": _scheduler_enqueue,
         "scheduler-tick": _scheduler_tick,
@@ -462,6 +489,14 @@ def _freeze_and_start_validation(args: argparse.Namespace) -> dict[str, Any]:
     return snapshot.to_dict()
 
 
+def _recover_validation_session(args: argparse.Namespace) -> dict[str, Any]:
+    workflow = RunWorkflow(RunStore(args.run_dir))
+    snapshot = workflow.recover_validation_session_from_request(
+        Actor.TEACHER, args.request, f"validation:recover:{file_sha256(args.request)}"
+    )
+    return snapshot.to_dict()
+
+
 def _resolve_teacher_skill(args: argparse.Namespace) -> dict[str, Any]:
     path = resolve_teacher_activation(
         args.question,
@@ -515,6 +550,14 @@ def _record_validation_round(args: argparse.Namespace) -> dict[str, Any]:
         Actor.TEACHER,
         request_id=args.request_id,
         idempotency_key=f"validation:round:{args.request_id}",
+    )
+    return snapshot.to_dict()
+
+
+def _decide_validation_round(args: argparse.Namespace) -> dict[str, Any]:
+    snapshot = RunWorkflow(RunStore(args.run_dir)).decide_validation_round(
+        Actor.TEACHER, request_id=args.request_id, action=args.action,
+        hint_path=args.hint,
     )
     return snapshot.to_dict()
 
@@ -638,6 +681,16 @@ def _begin_runtime_finalization(args: argparse.Namespace) -> dict[str, Any]:
     return snapshot.to_dict()
 
 
+def _complete_without_runtime_environment(args: argparse.Namespace) -> dict[str, Any]:
+    workflow = RunWorkflow(RunStore(args.run_dir))
+    snapshot = workflow.complete_without_runtime_environment(
+        Actor.TEACHER,
+        args.evidence,
+        f"publication:optional-runtime:{file_sha256(args.evidence)}",
+    )
+    return snapshot.to_dict()
+
+
 def _import_environment(args: argparse.Namespace) -> dict[str, Any]:
     receipt = FileLabwrightRegistry(args.state_root).import_stable(
         args.manifest,
@@ -675,6 +728,7 @@ def _issue_researcher(args: argparse.Namespace) -> dict[str, Any]:
         request_id=args.request_id,
         job_config_path=args.job_config,
         approved_hint_path=args.approved_hint,
+        closed_request_ids=tuple(args.closed_request_id),
     )
     output = asdict(handoff)
     handoff_path = Path(handoff.request_path).parent / "handoff.json"
@@ -778,11 +832,10 @@ def _execute_researcher_handoff(
         claim_id = claim.claim_id
         assert claim_id is not None
     store = CapabilityStore(Path(handoff.capability_path).parents[1])
-    request = (
-        store.redeem_runtime(handoff)
-        if runtime_owned
-        else store.redeem(handoff, thread_id)
-    )
+    if args.recovery_evidence is not None:
+        request = store.redeem_platform_recovery(handoff, thread_id, args.recovery_evidence)
+    else:
+        request = store.redeem_runtime(handoff) if runtime_owned else store.redeem(handoff, thread_id)
     queue.authorize(
         request.request_id,
         claim_id=claim_id,
@@ -839,6 +892,16 @@ def _harbor_queue_complete(args: argparse.Namespace) -> dict[str, Any]:
         )
         .to_dict()
     )
+
+
+def _harbor_queue_reclaim_stale(args: argparse.Namespace) -> dict[str, Any]:
+    """回收有中断证据且超过心跳期限的 ACTIVE claim。"""
+    return HarborJobQueue(args.queue_root).reclaim_stale(
+        args.request_id,
+        claim_id=args.claim_id,
+        stale_after_sec=args.stale_after_sec,
+        evidence_path=args.evidence,
+    ).to_dict()
 
 
 def _scheduler_status(args: argparse.Namespace) -> dict[str, Any]:

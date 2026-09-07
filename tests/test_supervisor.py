@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 
 from taskfoundry.supervisor import CampaignSupervisor
+from taskfoundry.supervisor_process import LocalProcessAdapter
 from taskfoundry.labwright import atomic_json
 from taskfoundry.model_probe import ProbeEvidence
 from taskfoundry.supervisor_state import (
@@ -19,8 +21,10 @@ from taskfoundry.supervisor_state import (
 class FakeProcesses:
     def __init__(self, *, alive: bool = True) -> None:
         self.is_alive = alive
+        self.launches = []
 
     def launch(self, command, *, cwd, stdout_path, stderr_path):
+        self.launches.append(command)
         return 8123
 
     def alive(self, process_id: int) -> bool:
@@ -40,6 +44,11 @@ class SuccessfulProbe:
         )
         atomic_json(output_path, evidence.__dict__)
         return evidence
+
+
+def test_local_process_adapter_rejects_unrelated_reused_pid() -> None:
+    """A durable PID from another namespace must not match an unrelated process."""
+    assert LocalProcessAdapter().alive(os.getpid()) is False
 
 
 def _plan(tmp_path: Path) -> SupervisorPlan:
@@ -180,6 +189,102 @@ def test_third_failed_blind_waits_for_teacher_hint(tmp_path: Path) -> None:
     )
 
 
+def test_teacher_hint_relaunches_bound_continuation_when_owner_died(
+    tmp_path: Path, monkeypatch
+) -> None:
+    snapshot = replace(
+        _running(tmp_path, last_decided_round=2),
+        phase=SupervisorPhase.TEACHER_ACTION,
+        scientific_round=3,
+    )
+    _register_running(tmp_path, snapshot)
+    run_dir = Path(_plan(tmp_path).run_dir)
+    supervisor_dir = run_dir / "supervisor"
+    supervisor_dir.mkdir(exist_ok=True)
+    (supervisor_dir / "teacher-action.json").write_text(
+        json.dumps(
+            {
+                "action": "CONTINUE_HINT",
+                "hint": "Use a grouped, physics-informed soft-transition basis.",
+                "teacher_declares_non_answer": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    decisions = []
+
+    class FakeWorkflow:
+        def __init__(self, store):
+            pass
+
+        def decide_persistent_validation_round(self, actor, **kwargs):
+            decisions.append(kwargs["decision"].action)
+
+    processes = FakeProcesses(alive=False)
+    monkeypatch.setattr("taskfoundry.supervisor.RunWorkflow", FakeWorkflow)
+    monkeypatch.setattr(
+        CampaignSupervisor,
+        "_persistent_recovery_command",
+        lambda self, plan, current, action_path: ["recovery-worker"],
+    )
+    supervisor = CampaignSupervisor(
+        tmp_path / "runs",
+        process_adapter=processes,
+    )
+
+    result = supervisor.resume("q12")
+
+    state = SupervisorStateStore(run_dir).read()
+    assert result.action == "TEACHER_ACTION_APPLIED_RECOVERY"
+    assert decisions == ["CONTINUE_HINT"]
+    assert processes.launches == [["recovery-worker"]]
+    assert state.phase is SupervisorPhase.RUNNING
+    assert state.process_id == 8123
+    assert state.last_decided_round == 3
+
+
+def test_resume_external_retries_bound_persistent_continuation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    snapshot = replace(
+        _running(tmp_path, last_decided_round=3),
+        phase=SupervisorPhase.WAITING_EXTERNAL,
+        scientific_round=4,
+        process_id=None,
+        process_started_at=None,
+        last_failure_stage="PLATFORM",
+        recovery_condition="provider health probe succeeds",
+    )
+    _register_running(tmp_path, snapshot)
+    request_dir = Path(snapshot.handoff_path).parent
+    controller = request_dir / "validation-control"
+    controller.mkdir()
+    (controller / "round-03-decision.json").write_text(
+        json.dumps({"action": "CONTINUE_HINT"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        CampaignSupervisor,
+        "_persistent_recovery_command",
+        lambda self, plan, current, action_path: ["recovery-worker"],
+    )
+    processes = FakeProcesses(alive=False)
+    supervisor = CampaignSupervisor(
+        tmp_path / "runs",
+        process_adapter=processes,
+    )
+
+    resumed = supervisor.resume("q12")
+    result = supervisor.run_once()
+
+    state = SupervisorStateStore(Path(_plan(tmp_path).run_dir)).read()
+    assert resumed.phase == SupervisorPhase.RETRY_SCHEDULED.value
+    assert result[0].action == "PERSISTENT_CONTINUATION_RETRIED"
+    assert processes.launches == [["recovery-worker"]]
+    assert state.phase is SupervisorPhase.RUNNING
+    assert state.request_id == "request-1"
+    assert state.runtime_attempt == 1
+
+
 def test_dead_worker_without_receipt_uses_retry_budget(tmp_path: Path) -> None:
     snapshot = _running(tmp_path)
     _register_running(tmp_path, snapshot)
@@ -207,6 +312,38 @@ def test_dead_worker_without_receipt_uses_retry_budget(tmp_path: Path) -> None:
     assert result[0].action == "RETRY_RUNTIME"
     assert state.phase is SupervisorPhase.RETRY_SCHEDULED
     assert state.next_action_at == "2026-08-31T12:01:30+00:00"
+
+
+def test_retry_closes_every_prior_lost_worker_request(tmp_path: Path) -> None:
+    plan = _plan(tmp_path)
+    supervisor_root = Path(plan.run_dir) / "supervisor"
+    supervisor_root.mkdir(parents=True)
+    for index in (1, 2):
+        (supervisor_root / f"lost-worker-runtime-{index:03d}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "question_id": "q12",
+                    "request_id": f"persistent-runtime-{index:03d}",
+                    "runtime_attempt": index,
+                    "failure_stage": "PLATFORM",
+                    "observed_at": "2026-08-31T12:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+    current = replace(
+        _running(tmp_path),
+        phase=SupervisorPhase.RETRY_SCHEDULED,
+        request_id="persistent-runtime-002",
+        process_id=None,
+        process_started_at=None,
+        next_action_at="2026-08-31T12:01:30+00:00",
+    )
+
+    assert CampaignSupervisor(tmp_path / "runs")._closed_request_ids_for_retry(
+        plan, current
+    ) == ("persistent-runtime-001", "persistent-runtime-002")
 
 
 def test_shared_model_probe_closes_circuit_and_resumes_all_waiters(

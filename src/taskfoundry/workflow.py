@@ -303,6 +303,45 @@ class RunWorkflow:
             next_snapshot,
         )
 
+    def recover_validation_session_from_request(
+        self, actor: Actor, request_path: Path, idempotency_key: str
+    ) -> RunSnapshot:
+        """从已封存的真实 Harbor request 恢复丢失的 validation session。"""
+        current = self._guard(actor, {Actor.TEACHER}, {RunState.PACKAGE_FROZEN})
+        request = self._json_object(request_path)
+        if (
+            request.get("run_id") != current.run_id
+            or request.get("package_sha256") != current.package_digest
+            or not request.get("request_id")
+        ):
+            raise WorkflowError("recovery request does not match frozen run")
+        session_id = str(request.get("validation_session_id") or f"recovered:{request['request_id']}")
+        researcher_id = str(request.get("researcher_thread_id", ""))
+        if not researcher_id:
+            raise WorkflowError("recovery request lacks researcher thread")
+        self._validation_session_registry().reserve(
+            run_id=current.run_id,
+            question_revision=current.question_revision,
+            validation_session_id=session_id,
+            researcher_thread_id=researcher_id,
+            package_sha256=current.package_digest or "",
+        )
+        session = {
+            "schema_version": 2,
+            "validation_session_id": session_id,
+            "researcher_thread_id": researcher_id,
+            "execution_owner": "harbor-recovery",
+            "question_revision": current.question_revision,
+            "package_sha256": current.package_digest,
+            "status": "ACTIVE",
+            "recovered_from_request": str(request_path.resolve()),
+        }
+        next_snapshot = self.store.advance(
+            current, state=RunState.BLIND_VALIDATION,
+            evidence=current.evidence | {"validation_session": session},
+        )
+        return self._commit(actor, "validation.session.recovered", idempotency_key, {"request_id": request["request_id"]}, next_snapshot)
+
     def issue_researcher_request(
         self,
         actor: Actor,
@@ -310,6 +349,7 @@ class RunWorkflow:
         request_id: str,
         job_config_path: Path,
         approved_hint_path: Path | None = None,
+        closed_request_ids: tuple[str, ...] = (),
     ) -> IssuedHandoff:
         """从当前线性会话派生并签发唯一合法 Researcher 请求。"""
         current = self._guard(
@@ -354,6 +394,7 @@ class RunWorkflow:
                 job_config_path=job_config_path,
                 persistent_payload=persistent_payload,
                 approved_hint_path=approved_hint_path,
+                closed_request_ids=closed_request_ids,
             )
         mode = "hint" if current.state is RunState.HINT_VALIDATION else "blind"
         round_index = len(receipts) + 1
@@ -429,6 +470,7 @@ class RunWorkflow:
         job_config_path: Path,
         persistent_payload: dict,
         approved_hint_path: Path | None,
+        closed_request_ids: tuple[str, ...],
     ) -> IssuedHandoff:
         """Issue one request for the whole Teacher-controlled validation session."""
         if current.state is not RunState.BLIND_VALIDATION or any(
@@ -489,7 +531,7 @@ class RunWorkflow:
             return CapabilityStore(self.store.run_dir / "researcher-requests").issue(
                 Actor.TEACHER,
                 request,
-                closed_request_ids=tuple(session_ledger),
+                closed_request_ids=tuple(dict.fromkeys((*session_ledger, *closed_request_ids))),
             )
         except (ContractError, OSError, ResearcherError) as error:
             raise WorkflowError(
@@ -579,7 +621,7 @@ class RunWorkflow:
             )
         next_snapshot = self.store.advance(
             current,
-            state=RunState.COMPLETED,
+            state=RunState.PUBLICATION_PENDING,
             environment_key=receipt.environment_key,
             evidence=current.evidence
             | {
@@ -1083,6 +1125,55 @@ class RunWorkflow:
             )
         return snapshot
 
+    def decide_validation_round(
+        self,
+        actor: Actor,
+        *,
+        request_id: str,
+        action: str,
+        hint_path: Path | None = None,
+    ) -> RunSnapshot:
+        """Record a Teacher decision for a non-persistent linear session."""
+        current = self._guard(
+            actor,
+            {Actor.TEACHER},
+            {RunState.BLIND_VALIDATION, RunState.HINT_VALIDATION},
+        )
+        expected = current.evidence.get("validation_decision", {}).get("action")
+        if action == "CONTINUE_HINT":
+            if expected != "NEXT_HINT" or hint_path is None or not hint_path.is_file():
+                raise WorkflowError("direct session is not ready for a hint")
+            content = hint_path.read_text(encoding="utf-8")
+            if not content.strip() or len(content.encode()) > 4096:
+                raise WorkflowError("hint is empty or too large")
+            next_state = RunState.HINT_VALIDATION
+            decision = {"action": action, "request_id": request_id,
+                        "hint": content, "teacher_declares_non_answer": True,
+                        "hint_sha256": file_sha256(hint_path)}
+        elif action == "CONTINUE_BLIND":
+            if expected != "NEXT_BLIND":
+                raise WorkflowError("direct session is not ready for blind continuation")
+            next_state = RunState.BLIND_VALIDATION
+            decision = {"action": action, "request_id": request_id}
+        elif action in {"STOP_TOO_EASY", "STOP_PASSED", "STOP_BLOCKED"}:
+            if action == "STOP_TOO_EASY": next_state = RunState.TOO_EASY
+            elif action == "STOP_PASSED": next_state = RunState.VALIDATION_PASSED
+            else: next_state = RunState.BLOCKED
+            decision = {"action": action, "request_id": request_id}
+        else:
+            raise WorkflowError("unsupported direct validation decision")
+        session = dict(current.evidence.get("validation_session", {}))
+        session["decision"] = action
+        if next_state in {RunState.TOO_EASY, RunState.VALIDATION_PASSED, RunState.BLOCKED}:
+            session["status"] = "CLOSED"
+        snapshot = self.store.advance(
+            current, state=next_state,
+            evidence=current.evidence | {"validation_decision": decision,
+                                          "validation_session": session},
+        )
+        return self._commit(actor, "validation.decision", f"validation:decision:{request_id}:{action}",
+                            decision, snapshot)
+
     def record_persistent_validation_session(
         self,
         actor: Actor,
@@ -1405,6 +1496,37 @@ class RunWorkflow:
             "runtime.finalization.started",
             idempotency_key,
             {"package_sha256": current.package_digest},
+            next_snapshot,
+        )
+
+    def complete_without_runtime_environment(
+        self,
+        actor: Actor,
+        evidence_path: Path,
+        idempotency_key: str,
+    ) -> RunSnapshot:
+        """完成发布资格；Labwright 环境固化是可选的后续复用步骤。"""
+        current = self._guard(actor, {Actor.TEACHER}, {RunState.RUNTIME_FINALIZATION})
+        if not evidence_path.is_file():
+            raise WorkflowError("environment reuse evidence is required")
+        evidence = self._json_object(evidence_path)
+        if evidence.get("status") not in {"OPTIONAL_UNAVAILABLE", "OPTIONAL_DEFERRED"}:
+            raise WorkflowError("optional environment evidence must declare unavailable or deferred")
+        next_evidence = dict(current.evidence)
+        next_evidence["environment_reuse"] = {
+            "status": evidence["status"],
+            "reason": str(evidence.get("reason", "")),
+            "path": str(evidence_path.resolve()),
+            "sha256": file_sha256(evidence_path),
+        }
+        next_snapshot = self.store.advance(
+            current, state=RunState.COMPLETED, evidence=next_evidence
+        )
+        return self._commit(
+            actor,
+            "publication.runtime_environment_optional",
+            idempotency_key,
+            {"status": evidence["status"]},
             next_snapshot,
         )
 

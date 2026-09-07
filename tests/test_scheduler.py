@@ -319,7 +319,7 @@ def test_completed_run_waits_for_validated_publication_before_releasing_slot(
     assert waiting.released == ()
     assert waiting.activated == ()
     q4 = next(item for item in waiting.snapshot.questions if item.question_id == "q4")
-    assert q4.state is QueueState.LEASED
+    assert q4.state is QueueState.PUBLICATION_PENDING
     assert q4.phase == "RUN_COMPLETED_AWAITING_PUBLICATION"
     assert q4.last_run_state == RunState.COMPLETED.value
     assert q4.published_family is None
@@ -377,7 +377,7 @@ def test_publication_binding_rejects_invalid_family_without_mutating_slot(
         )
 
     unchanged = scheduler.snapshot().questions[2]
-    assert unchanged.state is QueueState.LEASED
+    assert unchanged.state is QueueState.PUBLICATION_PENDING
     assert unchanged.published_family is None
     assert unchanged.completion_basis is None
 

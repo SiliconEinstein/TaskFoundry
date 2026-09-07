@@ -28,6 +28,7 @@ class QueueState(StrEnum):
     READY = "READY"
     LEASED = "LEASED"
     WAITING_EXTERNAL = "WAITING_EXTERNAL"
+    PUBLICATION_PENDING = "PUBLICATION_PENDING"
     RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
     BLOCKED = "BLOCKED"
     ABANDONED = "ABANDONED"
@@ -176,7 +177,7 @@ class ScheduledQuestion:
             raise ContractError("Teacher prompt path must be absolute")
         if self.published_family and not Path(self.published_family).is_absolute():
             raise ContractError("published family path must be absolute")
-        if self.state is QueueState.LEASED:
+        if self.state in {QueueState.LEASED, QueueState.PUBLICATION_PENDING}:
             if not self.lease or self.wait or self.lease.owner_id != self.teacher_thread_id:
                 raise ContractError("leased question requires its unique routed owner")
             self.lease.validate()

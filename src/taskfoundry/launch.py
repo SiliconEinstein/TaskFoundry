@@ -90,13 +90,14 @@ def check_launchability(root: Path, *, timeout_sec: int = 10) -> LaunchReport:
                 output_dir = probe_runtime / "outputs"
                 output_dir.mkdir()
                 completed = subprocess.run(
-                    ["/bin/sh", str(probe), "--probe"],
+                    ["/bin/bash", str(probe), "--probe"],
                     cwd=root,
                     env={
                         "PATH": "/usr/bin:/bin",
                         "LANG": "C.UTF-8",
                         "TASK_OUTPUT_DIR": str(output_dir),
                         "TASK_REFERENCE_PATH": str((root / "tests/reference.json").resolve()),
+                        "TASK_PUBLIC_DIR": str((root / "environment/public_data").resolve()),
                         "TASK_REWARD_PATH": str(probe_runtime / "reward.txt"),
                         "TASK_TESTS_DIR": str((root / "tests").resolve()),
                     },

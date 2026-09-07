@@ -565,7 +565,7 @@ def test_scheduler_cli_binds_validated_family_before_marking_complete(
     assert main(["scheduler-tick", str(root)]) == 0
     waiting = json.loads(capsys.readouterr().out)
     q3 = next(item for item in waiting["snapshot"]["questions"] if item["question_id"] == "q3")
-    assert q3["state"] == "LEASED"
+    assert q3["state"] == "PUBLICATION_PENDING"
     assert q3["phase"] == "RUN_COMPLETED_AWAITING_PUBLICATION"
 
     assert main([
